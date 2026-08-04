@@ -1358,7 +1358,9 @@ async def assign_instances(
     allow_affinity = True
     if getattr(args, "enable_reusable_prefix_affinity_gate", False):
         if reusable_prefix_tokens is None:
-            logger.warning(
+            # Demoted to DEBUG because every request would log this when Prefillers
+            # do not expose created_cache_tokens (e.g. the /v1/completions path).
+            logger.debug(
                 "Reusable-prefix affinity gate enabled but Prefill response is missing "
                 "complete prompt_tokens_details (reusable_prefix_tokens=None); falling back to "
                 "optimistic bind for request %s session=%s prefix=%s",

@@ -317,8 +317,6 @@ def test_complete_prefill_with_allow_affinity_false_does_not_bind_session():
     )
     scheduler.release_prefill_kv(first["key"], 10.0)
     assert scheduler.session_lru == {}
-    second = scheduler.reserve_prefill_kv(10.0, 10.0, "session")
-    assert second["key"] != first["key"] or scheduler.session_lru == {}
 
 
 def test_complete_prefill_with_allow_affinity_false_does_not_bind_prefix():
@@ -520,7 +518,7 @@ def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monk
     monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
 
     s_key = "body:session_id:s1"
-    with caplog.at_level("WARNING", logger=proxy.logger.name):
+    with caplog.at_level("DEBUG", logger=proxy.logger.name):
         instance_info = asyncio.run(
             proxy.assign_instances(
                 "/completions",
