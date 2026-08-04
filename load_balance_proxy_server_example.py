@@ -1017,6 +1017,16 @@ def parse_args() -> argparse.Namespace:
         help="Enable session and text-prefix affinity for Prefiller routing.",
     )
     parser.add_argument(
+        "--enable-reusable-prefix-affinity-gate",
+        action="store_true",
+        help=(
+            "Gate session/prefix affinity commit on the Prefill response's "
+            "reusable_prefix_tokens (cached_tokens + created_cache_tokens). "
+            "No-op without --enable-kv-cache-aware-routing. Prefillers should run "
+            "with --enable-prompt-tokens-details."
+        ),
+    )
+    parser.add_argument(
         "--session-lru-size",
         type=int,
         default=4096,
