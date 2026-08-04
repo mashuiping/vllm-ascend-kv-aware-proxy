@@ -27,8 +27,8 @@ case "${ROLE}" in
     ;;
 esac
 
-DEVICE_COUNT="${DEVICE_COUNT:-8}"
-INSTANCE_COUNT="${INSTANCE_COUNT:-4}"
+DEVICE_COUNT="${DEVICE_COUNT:-2}"
+INSTANCE_COUNT="${INSTANCE_COUNT:-1}"
 TP_SIZE="${TP_SIZE:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
@@ -69,7 +69,7 @@ export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT="${VLLM_MOONCAKE_ABORT_REQUEST_TIMEOU
 MOONCAKE_LIBRARY_DIR="/usr/local/lib64/python3.11/site-packages/mooncake"
 export LD_LIBRARY_PATH="${MOONCAKE_LIBRARY_DIR}:/usr/local/lib:/usr/local/lib64:/usr/local/Ascend/driver/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-DEVICE_IDS=(0 1 2 3 4 5 6 7)
+DEVICE_IDS=(0 1)
 
 if (( INSTANCE_COUNT * TP_SIZE != DEVICE_COUNT )); then
   echo "invalid topology: INSTANCE_COUNT(${INSTANCE_COUNT}) * TP_SIZE(${TP_SIZE}) must equal DEVICE_COUNT(${DEVICE_COUNT})" >&2
@@ -95,14 +95,18 @@ terminate_children() {
 }
 trap terminate_children EXIT INT TERM
 
-for ((instance = 0; instance < INSTANCE_COUNT; instance++)); do
-  device_offset=$((instance * TP_SIZE))
-  instance_devices=("${DEVICE_IDS[@]:device_offset:TP_SIZE}")
-  visible_devices="$(IFS=,; printf '%s' "${instance_devices[*]}")"
-  http_port=$((PORT_START + instance))
-  kv_port=$((MOONCAKE_KV_PORT + instance * TP_SIZE))
+if (( INSTANCE_COUNT != 1 )); then
+  echo "INSTANCE_COUNT must be 1: launch one vLLM process per Pod" >&2
+  exit 2
+fi
 
-  kv_transfer_config="$(
+instance=0
+instance_devices=("${DEVICE_IDS[@]:0:TP_SIZE}")
+visible_devices="$(IFS=,; printf '%s' "${instance_devices[*]}")"
+http_port="${PORT_START}"
+kv_port="${MOONCAKE_KV_PORT}"
+
+kv_transfer_config="$(
     printf '%s' \
       "{\"kv_connector\":\"MooncakeConnectorV1\"," \
       "\"kv_role\":\"${KV_ROLE}\"," \
@@ -113,7 +117,7 @@ for ((instance = 0; instance < INSTANCE_COUNT; instance++)); do
       "\"decode\":{\"dp_size\":1,\"tp_size\":${TP_SIZE}}}}"
   )"
 
-  command=(
+command=(
     vllm serve "${MODEL_PATH}"
     --host 0.0.0.0
     --port "${http_port}"
@@ -130,7 +134,7 @@ for ((instance = 0; instance < INSTANCE_COUNT; instance++)); do
     --kv-transfer-config "${kv_transfer_config}"
   )
 
-  if [[ "${ROLE}" == "prefill" ]]; then
+if [[ "${ROLE}" == "prefill" ]]; then
     command+=(
       --enable-chunked-prefill
       --enable-prefix-caching
@@ -140,29 +144,26 @@ for ((instance = 0; instance < INSTANCE_COUNT; instance++)); do
     command+=(--no-enable-prefix-caching)
   fi
 
-  if [[ -n "${REASONING_PARSER:-}" ]]; then
+if [[ -n "${REASONING_PARSER:-}" ]]; then
     command+=(--reasoning-parser "${REASONING_PARSER}")
   fi
 
-  echo "starting ${ROLE} instance=${instance} devices=${visible_devices} http_port=${http_port} kv_port=${kv_port}"
-  (
-    set -o pipefail
-    ASCEND_RT_VISIBLE_DEVICES="${visible_devices}" "${command[@]}" 2>&1 \
-      | sed -u "s/^/[${ROLE}-${instance}] /"
-  ) &
-  children+=("$!")
-  sleep "${STARTUP_STAGGER_SECONDS}"
-done
+echo "starting ${ROLE} instance=${instance} devices=${visible_devices} http_port=${http_port} kv_port=${kv_port}"
+(
+  set -o pipefail
+  ASCEND_RT_VISIBLE_DEVICES="${visible_devices}" "${command[@]}" 2>&1 \
+    | sed -u "s/^/[${ROLE}-${instance}] /"
+) &
+children+=("$!")
 
-python - "${PORT_START}" "${INSTANCE_COUNT}" <<'PY'
+python - "${PORT_START}" <<'PY'
 import sys
 import time
 import urllib.request
 
 port_start = int(sys.argv[1])
-count = int(sys.argv[2])
 deadline = time.monotonic() + 3600
-pending = set(range(count))
+pending = {0}
 
 while pending and time.monotonic() < deadline:
     for instance in list(pending):
@@ -173,19 +174,19 @@ while pending and time.monotonic() < deadline:
             ) as response:
                 if response.status == 200:
                     pending.remove(instance)
-                    print(f"instance {instance} is ready", flush=True)
+                    print("instance 0 is ready", flush=True)
         except Exception:
             pass
     if pending:
-        print(f"waiting for instances: {sorted(pending)}", flush=True)
+        print("waiting for instance: 0", flush=True)
         time.sleep(5)
 
 if pending:
-    raise SystemExit(f"startup timed out; instances not ready: {sorted(pending)}")
+    raise SystemExit("startup timed out; instance 0 is not ready")
 PY
 
 : >/tmp/pd-ready
-echo "${ROLE} instances are ready"
+echo "${ROLE} instance is ready"
 
 wait -n "${children[@]}"
 echo "a ${ROLE} instance exited; terminating the pod" >&2

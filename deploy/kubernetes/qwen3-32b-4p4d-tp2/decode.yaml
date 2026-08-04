@@ -6,23 +6,23 @@ metadata:
   labels:
     app.kubernetes.io/name: pd-decode
 spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: pd-decode
   ports:
-    - {name: d0, port: 7200, targetPort: 7200}
-    - {name: d1, port: 7201, targetPort: 7201}
-    - {name: d2, port: 7202, targetPort: 7202}
-    - {name: d3, port: 7203, targetPort: 7203}
+    - {name: http, port: 7200, targetPort: 7200}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: pd-decode
   namespace: __NAMESPACE__
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  serviceName: pd-decode
+  replicas: 4
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: pd-decode
@@ -45,8 +45,8 @@ spec:
           env:
             - {name: ROLE, value: "decode"}
             - {name: NIC_NAME, value: "__NIC_NAME__"}
-            - {name: DEVICE_COUNT, value: "8"}
-            - {name: INSTANCE_COUNT, value: "4"}
+            - {name: DEVICE_COUNT, value: "2"}
+            - {name: INSTANCE_COUNT, value: "1"}
             - {name: TP_SIZE, value: "2"}
             - {name: PORT_START, value: "7200"}
             - {name: MOONCAKE_KV_PORT, value: "30200"}
@@ -59,9 +59,9 @@ spec:
             - {name: REASONING_PARSER, value: "__REASONING_PARSER__"}
           resources:
             requests:
-              __NPU_RESOURCE__: "8"
+              __NPU_RESOURCE__: "2"
             limits:
-              __NPU_RESOURCE__: "8"
+              __NPU_RESOURCE__: "2"
           startupProbe:
             exec:
               command: ["/bin/bash", "-ec", "test -f /tmp/pd-ready"]

@@ -1,20 +1,20 @@
 # Qwen3-32B 4P4D TP2 on Ascend 910B2
 
-This deployment starts four independent TP2 Prefill instances on one 8-NPU
-node, four independent TP2 Decode instances on another 8-NPU node, and one
-P/D proxy. It is a controlled experiment topology, not a generic production
-chart.
+This deployment starts four Prefill Pods with one independent TP2 vLLM process
+per Pod on one 8-NPU node, four equivalent Decode Pods on another 8-NPU node,
+and one P/D proxy. It is a controlled experiment topology, not a generic
+production chart.
 
 ## Fixed topology
 
 | Item | Value |
 | --- | --- |
 | Model | Qwen3-32B, unquantized |
-| Prefill | 4 independent instances, TP2 |
-| Decode | 4 independent instances, TP2 |
+| Prefill | 4 Pods, one independent process per Pod, TP2 |
+| Decode | 4 Pods, one independent process per Pod, TP2 |
 | NPU assignment | `0,1`, `2,3`, `4,5`, `6,7` |
-| Prefill API ports | `7100-7103` |
-| Decode API ports | `7200-7203` |
+| Prefill API port | `7100` in each Pod |
+| Decode API port | `7200` in each Pod |
 | Proxy port | `8000` |
 | KV connector | MooncakeConnectorV1, Ascend Direct |
 | KV block size | 128 |
@@ -38,6 +38,11 @@ before using this deployment outside an isolated test cluster.
 Required driver paths and networking assumptions are visible directly in
 `prefill.yaml`, `decode.yaml` and `launch_role.sh`. Validate them against the
 target cluster rather than assuming another Ascend installation is identical.
+
+The Prefill and Decode Services are headless. The proxy connects to stable
+StatefulSet DNS names (`pd-prefill-0.pd-prefill` through `pd-prefill-3.pd-prefill`
+and the corresponding Decode names), so each process remains an independently
+tracked backend.
 
 ## Configuration
 
@@ -129,4 +134,3 @@ bash deploy.sh cleanup-all
 ```
 
 The Namespace itself is intentionally retained.
-

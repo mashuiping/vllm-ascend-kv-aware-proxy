@@ -6,23 +6,23 @@ metadata:
   labels:
     app.kubernetes.io/name: pd-prefill
 spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: pd-prefill
   ports:
-    - {name: p0, port: 7100, targetPort: 7100}
-    - {name: p1, port: 7101, targetPort: 7101}
-    - {name: p2, port: 7102, targetPort: 7102}
-    - {name: p3, port: 7103, targetPort: 7103}
+    - {name: http, port: 7100, targetPort: 7100}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: pd-prefill
   namespace: __NAMESPACE__
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  serviceName: pd-prefill
+  replicas: 4
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: pd-prefill
@@ -45,8 +45,8 @@ spec:
           env:
             - {name: ROLE, value: "prefill"}
             - {name: NIC_NAME, value: "__NIC_NAME__"}
-            - {name: DEVICE_COUNT, value: "8"}
-            - {name: INSTANCE_COUNT, value: "4"}
+            - {name: DEVICE_COUNT, value: "2"}
+            - {name: INSTANCE_COUNT, value: "1"}
             - {name: TP_SIZE, value: "2"}
             - {name: PORT_START, value: "7100"}
             - {name: MOONCAKE_KV_PORT, value: "30000"}
@@ -59,9 +59,9 @@ spec:
             - {name: REASONING_PARSER, value: "__REASONING_PARSER__"}
           resources:
             requests:
-              __NPU_RESOURCE__: "8"
+              __NPU_RESOURCE__: "2"
             limits:
-              __NPU_RESOURCE__: "8"
+              __NPU_RESOURCE__: "2"
           startupProbe:
             exec:
               command: ["/bin/bash", "-ec", "test -f /tmp/pd-ready"]

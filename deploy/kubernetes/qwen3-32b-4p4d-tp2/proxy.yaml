@@ -50,25 +50,25 @@ spec:
             - --log-level
             - INFO
             - --prefiller-hosts
-            - pd-prefill
-            - pd-prefill
-            - pd-prefill
-            - pd-prefill
+            - pd-prefill-0.pd-prefill
+            - pd-prefill-1.pd-prefill
+            - pd-prefill-2.pd-prefill
+            - pd-prefill-3.pd-prefill
             - --prefiller-ports
             - "7100"
-            - "7101"
-            - "7102"
-            - "7103"
+            - "7100"
+            - "7100"
+            - "7100"
             - --decoder-hosts
-            - pd-decode
-            - pd-decode
-            - pd-decode
-            - pd-decode
+            - pd-decode-0.pd-decode
+            - pd-decode-1.pd-decode
+            - pd-decode-2.pd-decode
+            - pd-decode-3.pd-decode
             - --decoder-ports
             - "7200"
-            - "7201"
-            - "7202"
-            - "7203"
+            - "7200"
+            - "7200"
+            - "7200"
           ports:
             - {name: http, containerPort: 8000}
           startupProbe:

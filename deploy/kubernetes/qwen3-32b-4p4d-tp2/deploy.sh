@@ -44,8 +44,8 @@ RESTART_TOKEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 usage() {
   cat <<'EOF'
 Usage:
-  deploy.sh prefill   # start 4 Prefill replicas, each TP2
-  deploy.sh decode    # start 4 Decode replicas, each TP2
+  deploy.sh prefill   # start 4 Prefill Pods, one TP2 process per Pod
+  deploy.sh decode    # start 4 Decode Pods, one TP2 process per Pod
   deploy.sh proxy     # create/update the load-balancing proxy
   deploy.sh all       # Prefill -> Decode -> Proxy
   deploy.sh status
@@ -172,15 +172,22 @@ apply_proxy_config() {
 apply_prefill() {
   require_value PREFILL_NODE
   kubectl get node "${PREFILL_NODE}" >/dev/null
+  # A previous version used a Deployment with the same name. Kubernetes cannot
+  # change a resource kind in place, so remove that legacy object before the
+  # StatefulSet is created.
+  kubectl -n "${NAMESPACE}" delete deployment/pd-prefill --ignore-not-found=true --wait=true --timeout=5m
+  kubectl -n "${NAMESPACE}" delete service/pd-prefill --ignore-not-found=true --wait=true --timeout=5m
   render "${SCRIPT_DIR}/prefill.yaml" | kubectl apply -f -
-  kubectl -n "${NAMESPACE}" rollout status deployment/pd-prefill --timeout=60m
+  kubectl -n "${NAMESPACE}" rollout status statefulset/pd-prefill --timeout=60m
 }
 
 apply_decode() {
   require_value DECODE_NODE
   kubectl get node "${DECODE_NODE}" >/dev/null
+  kubectl -n "${NAMESPACE}" delete deployment/pd-decode --ignore-not-found=true --wait=true --timeout=5m
+  kubectl -n "${NAMESPACE}" delete service/pd-decode --ignore-not-found=true --wait=true --timeout=5m
   render "${SCRIPT_DIR}/decode.yaml" | kubectl apply -f -
-  kubectl -n "${NAMESPACE}" rollout status deployment/pd-decode --timeout=60m
+  kubectl -n "${NAMESPACE}" rollout status statefulset/pd-decode --timeout=60m
 }
 
 apply_proxy() {
@@ -208,6 +215,7 @@ cleanup_prefill() {
     return 0
   fi
   kubectl -n "${NAMESPACE}" delete \
+    statefulset/pd-prefill \
     deployment/pd-prefill \
     service/pd-prefill \
     --ignore-not-found=true \
@@ -221,6 +229,7 @@ cleanup_decode() {
     return 0
   fi
   kubectl -n "${NAMESPACE}" delete \
+    statefulset/pd-decode \
     deployment/pd-decode \
     service/pd-decode \
     --ignore-not-found=true \
@@ -248,6 +257,8 @@ cleanup_all() {
     return 0
   fi
   kubectl -n "${NAMESPACE}" delete \
+    statefulset/pd-prefill \
+    statefulset/pd-decode \
     deployment/pd-prefill \
     deployment/pd-decode \
     deployment/pd-proxy \
