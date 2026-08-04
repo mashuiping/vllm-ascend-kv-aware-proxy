@@ -198,6 +198,23 @@ def extract_cached_tokens(response_json: dict) -> int | None:
     return cached_tokens if isinstance(cached_tokens, int) else None
 
 
+def extract_reusable_prefix_tokens(response_json: dict) -> int | None:
+    """Sum cached and created cache tokens from the Prefill response.
+
+    Returns None when the details are missing or incomplete. The caller decides
+    how to react (warn + bind, or skip binding).
+    """
+    usage = response_json.get("usage") or {}
+    prompt_tokens_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_tokens_details, dict):
+        return None
+    cached_tokens = prompt_tokens_details.get("cached_tokens")
+    created_cache_tokens = prompt_tokens_details.get("created_cache_tokens")
+    if not isinstance(cached_tokens, int) or not isinstance(created_cache_tokens, int):
+        return None
+    return cached_tokens + created_cache_tokens
+
+
 def update_cached_tokens_in_chunk(chunk_json: dict, cached_tokens: int | None) -> bool:
     if cached_tokens is None:
         return False

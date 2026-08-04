@@ -256,3 +256,54 @@ def test_affinity_lru_eviction_removal_and_reset():
     scheduler.clear_affinity_caches()
     assert scheduler.session_lru == {}
     assert scheduler.prefix_lru == {}
+
+
+def test_extract_reusable_prefix_tokens_sums_cached_and_created():
+    response = {
+        "usage": {
+            "prompt_tokens_details": {
+                "cached_tokens": 256,
+                "created_cache_tokens": 128,
+            }
+        }
+    }
+    assert proxy.extract_reusable_prefix_tokens(response) == 384
+
+
+def test_extract_reusable_prefix_tokens_returns_zero_when_both_zero():
+    response = {
+        "usage": {
+            "prompt_tokens_details": {
+                "cached_tokens": 0,
+                "created_cache_tokens": 0,
+            }
+        }
+    }
+    assert proxy.extract_reusable_prefix_tokens(response) == 0
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"usage": {}},
+        {"usage": {"prompt_tokens_details": None}},
+        {"usage": {"prompt_tokens_details": {"cached_tokens": 256}}},
+        {"usage": {"prompt_tokens_details": {"created_cache_tokens": 128}}},
+        {"usage": {"prompt_tokens_details": {"cached_tokens": "256", "created_cache_tokens": 0}}},
+        {"usage": {"prompt_tokens_details": {"cached_tokens": 256, "created_cache_tokens": "0"}}},
+        {"usage": {"prompt_tokens_details": [256, 0]}},
+    ],
+    ids=[
+        "missing-usage",
+        "empty-usage",
+        "null-details",
+        "missing-created",
+        "missing-cached",
+        "non-int-cached",
+        "non-int-created",
+        "non-dict-details",
+    ],
+)
+def test_extract_reusable_prefix_tokens_incomplete_returns_none(response):
+    assert proxy.extract_reusable_prefix_tokens(response) is None
