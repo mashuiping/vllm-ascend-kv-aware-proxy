@@ -307,3 +307,40 @@ def test_extract_reusable_prefix_tokens_returns_zero_when_both_zero():
 )
 def test_extract_reusable_prefix_tokens_incomplete_returns_none(response):
     assert proxy.extract_reusable_prefix_tokens(response) is None
+
+
+def test_complete_prefill_with_allow_affinity_false_does_not_bind_session():
+    scheduler = make_scheduler()
+    first = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(
+        first["key"], 10.0, "session", None, route_source="session", allow_affinity=False
+    )
+    scheduler.release_prefill_kv(first["key"], 10.0)
+    assert scheduler.session_lru == {}
+    second = scheduler.reserve_prefill_kv(10.0, 10.0, "session")
+    assert second["key"] != first["key"] or scheduler.session_lru == {}
+
+
+def test_complete_prefill_with_allow_affinity_false_does_not_bind_prefix():
+    scheduler = make_scheduler()
+    first = scheduler.begin_request(10.0, 10.0, None, "prefix")
+    scheduler.complete_prefill(
+        first["key"], 10.0, None, "prefix", route_source="prefix", allow_affinity=False
+    )
+    scheduler.release_prefill_kv(first["key"], 10.0)
+    assert scheduler.prefix_lru == {}
+
+
+def test_complete_prefill_allow_affinity_false_preserves_existing_bindings():
+    scheduler = make_scheduler()
+    first = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(first["key"], 10.0, "session", None)
+    bound = scheduler.session_lru["session"]
+    scheduler.release_prefill_kv(first["key"], 10.0)
+
+    second = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(
+        second["key"], 10.0, "session", None, route_source="session", allow_affinity=False
+    )
+    scheduler.release_prefill_kv(second["key"], 10.0)
+    assert scheduler.session_lru["session"] == bound

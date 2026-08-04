@@ -686,10 +686,16 @@ class SharedProxyScheduler:
         session_key: str | None,
         prefix_key: str | None,
         route_source: str = "heap",
+        allow_affinity: bool = True,
     ) -> None:
         """Release compute pressure and commit affinity after a successful Prefill."""
         with self._lock:
             self._release_load(ServerRole.PREFILL, key, compute_load, active_tokens=True)
+            if not allow_affinity:
+                # Gate decided this Prefill left no reusable prefix worth pinning.
+                # Compute load is still released; session/prefix maps are touched
+                # only by callers that opt in.
+                return
             # A failed Prefill cannot own reusable KV, so mappings are committed
             # here rather than when the node is initially selected.
             if session_key:
