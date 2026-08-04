@@ -12,7 +12,7 @@ production chart.
 | Model | Qwen3-32B, unquantized |
 | Prefill | 4 Pods, one independent process per Pod, TP2 |
 | Decode | 4 Pods, one independent process per Pod, TP2 |
-| NPU assignment | `0,1`, `2,3`, `4,5`, `6,7` |
+| NPU assignment | 2 devices per Pod, allocated by the Ascend device plugin |
 | Prefill API port | `7100` in each Pod |
 | Decode API port | `7200` in each Pod |
 | Proxy port | `8000` |
@@ -21,14 +21,19 @@ production chart.
 | Prefix cache | enabled on Prefill, disabled on Decode |
 | Proxy workers | 1 |
 
-The Pods are privileged because the supplied vllm-ascend runtime requires
-Ascend device and driver access. Review every hostPath and security setting
-before using this deployment outside an isolated test cluster.
+The vLLM containers are not privileged. The Ascend device plugin must inject
+exactly two `/dev/davinciN` devices per Pod plus `/dev/davinci_manager`,
+`/dev/devmm_svm` and `/dev/hisi_hdc`. The launcher validates this before it
+starts vLLM and does not override the runtime's device visibility mapping.
+Review every hostPath and security setting before using this deployment outside
+an isolated test cluster.
 
 ## Prerequisites
 
 - Two Kubernetes nodes with eight Ascend 910B2 NPUs each.
 - Ascend device plugin and a known extended resource name.
+- Ascend container runtime/hook configured so device-plugin allocations are
+  materialized as device nodes in non-privileged workload containers.
 - Cross-node HCCN connectivity for Ascend Direct.
 - A compatible vllm-ascend image containing Mooncake, FastAPI, HTTPX and
   Uvicorn.

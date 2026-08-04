@@ -169,14 +169,41 @@ apply_proxy_config() {
     --dry-run=client -o yaml | kubectl apply -f -
 }
 
+prepare_role_migration() {
+  local role="$1"
+  local service_name="pd-${role}"
+  local cluster_ip
+  local pod_management_policy
+
+  # Remove objects from the former Deployment/non-headless-Service layout only
+  # when they are actually present. A headless Service should stay available
+  # during normal updates so the proxy does not lose backend DNS resolution.
+  kubectl -n "${NAMESPACE}" delete "deployment/${service_name}" \
+    --ignore-not-found=true --wait=true --timeout=5m
+
+  cluster_ip="$(
+    kubectl -n "${NAMESPACE}" get "service/${service_name}" \
+      -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true
+  )"
+  if [[ -n "${cluster_ip}" && "${cluster_ip}" != "None" ]]; then
+    kubectl -n "${NAMESPACE}" delete "service/${service_name}" --wait=true --timeout=5m
+  fi
+
+  # podManagementPolicy is immutable. Recreate only StatefulSets created by an
+  # earlier version that still use OrderedReady.
+  pod_management_policy="$(
+    kubectl -n "${NAMESPACE}" get "statefulset/${service_name}" \
+      -o jsonpath='{.spec.podManagementPolicy}' 2>/dev/null || true
+  )"
+  if [[ -n "${pod_management_policy}" && "${pod_management_policy}" != "Parallel" ]]; then
+    kubectl -n "${NAMESPACE}" delete "statefulset/${service_name}" --wait=true --timeout=5m
+  fi
+}
+
 apply_prefill() {
   require_value PREFILL_NODE
   kubectl get node "${PREFILL_NODE}" >/dev/null
-  # A previous version used a Deployment with the same name. Kubernetes cannot
-  # change a resource kind in place, so remove that legacy object before the
-  # StatefulSet is created.
-  kubectl -n "${NAMESPACE}" delete deployment/pd-prefill --ignore-not-found=true --wait=true --timeout=5m
-  kubectl -n "${NAMESPACE}" delete service/pd-prefill --ignore-not-found=true --wait=true --timeout=5m
+  prepare_role_migration prefill
   render "${SCRIPT_DIR}/prefill.yaml" | kubectl apply -f -
   kubectl -n "${NAMESPACE}" rollout status statefulset/pd-prefill --timeout=60m
 }
@@ -184,8 +211,7 @@ apply_prefill() {
 apply_decode() {
   require_value DECODE_NODE
   kubectl get node "${DECODE_NODE}" >/dev/null
-  kubectl -n "${NAMESPACE}" delete deployment/pd-decode --ignore-not-found=true --wait=true --timeout=5m
-  kubectl -n "${NAMESPACE}" delete service/pd-decode --ignore-not-found=true --wait=true --timeout=5m
+  prepare_role_migration decode
   render "${SCRIPT_DIR}/decode.yaml" | kubectl apply -f -
   kubectl -n "${NAMESPACE}" rollout status statefulset/pd-decode --timeout=60m
 }

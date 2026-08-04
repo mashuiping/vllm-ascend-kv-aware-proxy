@@ -34,9 +34,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-32b}"
 NIC_NAME="${NIC_NAME:-eth0}"
-STARTUP_STAGGER_SECONDS="${STARTUP_STAGGER_SECONDS:-2}"
+POD_NAME="${POD_NAME:-${HOSTNAME:-${ROLE}-unknown}}"
+ENGINE_ID="${ROLE}-${POD_NAME}"
 
-for runtime_command in python vllm sed sleep hostname awk; do
+for runtime_command in python vllm sed hostname awk; do
   if ! command -v "${runtime_command}" >/dev/null 2>&1; then
     echo "missing required runtime command: ${runtime_command}" >&2
     exit 2
@@ -69,17 +70,30 @@ export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT="${VLLM_MOONCAKE_ABORT_REQUEST_TIMEOU
 MOONCAKE_LIBRARY_DIR="/usr/local/lib64/python3.11/site-packages/mooncake"
 export LD_LIBRARY_PATH="${MOONCAKE_LIBRARY_DIR}:/usr/local/lib:/usr/local/lib64:/usr/local/Ascend/driver/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-DEVICE_IDS=(0 1)
-
 if (( INSTANCE_COUNT * TP_SIZE != DEVICE_COUNT )); then
   echo "invalid topology: INSTANCE_COUNT(${INSTANCE_COUNT}) * TP_SIZE(${TP_SIZE}) must equal DEVICE_COUNT(${DEVICE_COUNT})" >&2
   exit 2
 fi
 
-if (( ${#DEVICE_IDS[@]} != DEVICE_COUNT )); then
-  echo "fixed device map has ${#DEVICE_IDS[@]} entries, expected ${DEVICE_COUNT}" >&2
+# Kubernetes' Ascend device plugin must inject only the NPU device nodes
+# allocated to this Pod. Do not override its mapping with host physical IDs.
+shopt -s nullglob
+device_nodes=(/dev/davinci[0-9]*)
+shopt -u nullglob
+if (( ${#device_nodes[@]} != DEVICE_COUNT )); then
+  echo "expected ${DEVICE_COUNT} allocated NPU device nodes, found ${#device_nodes[@]}: ${device_nodes[*]:-<none>}" >&2
   exit 2
 fi
+
+for common_device in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
+  if [[ ! -c "${common_device}" ]]; then
+    echo "required Ascend device node was not injected: ${common_device}" >&2
+    exit 2
+  fi
+done
+
+echo "allocated NPU devices: ${device_nodes[*]}"
+echo "device visibility: ASCEND_VISIBLE_DEVICES=${ASCEND_VISIBLE_DEVICES:-<unset>} ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
 
 MOONCAKE_CONFIG_PATH="/tmp/mooncake-${ROLE}.json"
 export MOONCAKE_CONFIG_PATH
@@ -100,9 +114,6 @@ if (( INSTANCE_COUNT != 1 )); then
   exit 2
 fi
 
-instance=0
-instance_devices=("${DEVICE_IDS[@]:0:TP_SIZE}")
-visible_devices="$(IFS=,; printf '%s' "${instance_devices[*]}")"
 http_port="${PORT_START}"
 kv_port="${MOONCAKE_KV_PORT}"
 
@@ -111,7 +122,7 @@ kv_transfer_config="$(
       "{\"kv_connector\":\"MooncakeConnectorV1\"," \
       "\"kv_role\":\"${KV_ROLE}\"," \
       "\"kv_port\":\"${kv_port}\"," \
-      "\"engine_id\":\"${ROLE}-${instance}\"," \
+      "\"engine_id\":\"${ENGINE_ID}\"," \
       "\"kv_connector_extra_config\":{" \
       "\"prefill\":{\"dp_size\":1,\"tp_size\":${TP_SIZE}}," \
       "\"decode\":{\"dp_size\":1,\"tp_size\":${TP_SIZE}}}}"
@@ -148,11 +159,10 @@ if [[ -n "${REASONING_PARSER:-}" ]]; then
     command+=(--reasoning-parser "${REASONING_PARSER}")
   fi
 
-echo "starting ${ROLE} instance=${instance} devices=${visible_devices} http_port=${http_port} kv_port=${kv_port}"
+echo "starting ${ROLE} pod=${POD_NAME} engine_id=${ENGINE_ID} http_port=${http_port} kv_port=${kv_port}"
 (
   set -o pipefail
-  ASCEND_RT_VISIBLE_DEVICES="${visible_devices}" "${command[@]}" 2>&1 \
-    | sed -u "s/^/[${ROLE}-${instance}] /"
+  "${command[@]}" 2>&1 | sed -u "s/^/[${POD_NAME}] /"
 ) &
 children+=("$!")
 

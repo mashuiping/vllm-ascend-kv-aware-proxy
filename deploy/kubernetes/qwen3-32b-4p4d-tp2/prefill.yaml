@@ -21,6 +21,7 @@ metadata:
 spec:
   serviceName: pd-prefill
   replicas: 4
+  podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
   selector:
@@ -40,10 +41,15 @@ spec:
           image: "__VLLM_IMAGE__"
           imagePullPolicy: IfNotPresent
           securityContext:
-            privileged: true
+            privileged: false
+            allowPrivilegeEscalation: false
           command: ["/bin/bash", "/opt/pd/launch_role.sh"]
           env:
             - {name: ROLE, value: "prefill"}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - {name: NIC_NAME, value: "__NIC_NAME__"}
             - {name: DEVICE_COUNT, value: "2"}
             - {name: INSTANCE_COUNT, value: "1"}
