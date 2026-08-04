@@ -7,7 +7,7 @@ set -Eeuo pipefail
 case "${ROLE}" in
   prefill)
     KV_ROLE="kv_producer"
-    PORT_START="${PORT_START:-7100}"
+    HTTP_PORT="${HTTP_PORT:-7100}"
     MOONCAKE_KV_PORT="${MOONCAKE_KV_PORT:-30000}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
@@ -15,7 +15,7 @@ case "${ROLE}" in
     ;;
   decode)
     KV_ROLE="kv_consumer"
-    PORT_START="${PORT_START:-7200}"
+    HTTP_PORT="${HTTP_PORT:-7200}"
     MOONCAKE_KV_PORT="${MOONCAKE_KV_PORT:-30200}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
@@ -28,7 +28,6 @@ case "${ROLE}" in
 esac
 
 DEVICE_COUNT="${DEVICE_COUNT:-2}"
-INSTANCE_COUNT="${INSTANCE_COUNT:-1}"
 TP_SIZE="${TP_SIZE:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
@@ -70,8 +69,8 @@ export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT="${VLLM_MOONCAKE_ABORT_REQUEST_TIMEOU
 MOONCAKE_LIBRARY_DIR="/usr/local/lib64/python3.11/site-packages/mooncake"
 export LD_LIBRARY_PATH="${MOONCAKE_LIBRARY_DIR}:/usr/local/lib:/usr/local/lib64:/usr/local/Ascend/driver/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-if (( INSTANCE_COUNT * TP_SIZE != DEVICE_COUNT )); then
-  echo "invalid topology: INSTANCE_COUNT(${INSTANCE_COUNT}) * TP_SIZE(${TP_SIZE}) must equal DEVICE_COUNT(${DEVICE_COUNT})" >&2
+if (( TP_SIZE != DEVICE_COUNT )); then
+  echo "invalid topology: TP_SIZE(${TP_SIZE}) must equal DEVICE_COUNT(${DEVICE_COUNT}) for one process per Pod" >&2
   exit 2
 fi
 
@@ -100,21 +99,15 @@ export MOONCAKE_CONFIG_PATH
 printf '{"local_hostname":"%s","device_name":"","protocol":"ascend"}\n' \
   "${LOCAL_IP}" >"${MOONCAKE_CONFIG_PATH}"
 
-children=()
-terminate_children() {
-  if (( ${#children[@]} > 0 )); then
-    kill "${children[@]}" 2>/dev/null || true
-    wait "${children[@]}" 2>/dev/null || true
+child_pid=""
+terminate_child() {
+  if [[ -n "${child_pid}" ]]; then
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
   fi
 }
-trap terminate_children EXIT INT TERM
+trap terminate_child EXIT INT TERM
 
-if (( INSTANCE_COUNT != 1 )); then
-  echo "INSTANCE_COUNT must be 1: launch one vLLM process per Pod" >&2
-  exit 2
-fi
-
-http_port="${PORT_START}"
 kv_port="${MOONCAKE_KV_PORT}"
 
 kv_transfer_config="$(
@@ -131,7 +124,7 @@ kv_transfer_config="$(
 command=(
     vllm serve "${MODEL_PATH}"
     --host 0.0.0.0
-    --port "${http_port}"
+    --port "${HTTP_PORT}"
     --tensor-parallel-size "${TP_SIZE}"
     --seed 1024
     --served-model-name "${SERVED_MODEL_NAME}"
@@ -159,45 +152,40 @@ if [[ -n "${REASONING_PARSER:-}" ]]; then
     command+=(--reasoning-parser "${REASONING_PARSER}")
   fi
 
-echo "starting ${ROLE} pod=${POD_NAME} engine_id=${ENGINE_ID} http_port=${http_port} kv_port=${kv_port}"
+echo "starting ${ROLE} pod=${POD_NAME} engine_id=${ENGINE_ID} http_port=${HTTP_PORT} kv_port=${kv_port}"
 (
   set -o pipefail
   "${command[@]}" 2>&1 | sed -u "s/^/[${POD_NAME}] /"
 ) &
-children+=("$!")
+child_pid="$!"
 
-python - "${PORT_START}" <<'PY'
+python - "${HTTP_PORT}" "${ROLE}" "${POD_NAME}" <<'PY'
 import sys
 import time
 import urllib.request
 
-port_start = int(sys.argv[1])
+port = int(sys.argv[1])
+role = sys.argv[2]
+pod_name = sys.argv[3]
 deadline = time.monotonic() + 3600
-pending = {0}
 
-while pending and time.monotonic() < deadline:
-    for instance in list(pending):
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port_start + instance}/health",
-                timeout=2,
-            ) as response:
-                if response.status == 200:
-                    pending.remove(instance)
-                    print("instance 0 is ready", flush=True)
-        except Exception:
-            pass
-    if pending:
-        print("waiting for instance: 0", flush=True)
-        time.sleep(5)
-
-if pending:
-    raise SystemExit("startup timed out; instance 0 is not ready")
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+            if response.status == 200:
+                print(f"{role} Pod {pod_name} is healthy", flush=True)
+                break
+    except Exception:
+        pass
+    print(f"waiting for {role} Pod {pod_name} on port {port}", flush=True)
+    time.sleep(5)
+else:
+    raise SystemExit(f"startup timed out; {role} Pod {pod_name} is not healthy")
 PY
 
 : >/tmp/pd-ready
-echo "${ROLE} instance is ready"
+echo "${ROLE} Pod ${POD_NAME} is ready"
 
-wait -n "${children[@]}"
-echo "a ${ROLE} instance exited; terminating the pod" >&2
+wait "${child_pid}"
+echo "the ${ROLE} vLLM process exited; terminating Pod ${POD_NAME}" >&2
 exit 1

@@ -129,8 +129,8 @@ disabled.
 ## Kubernetes quick start
 
 The first deployment is deliberately specific: two 8-NPU Ascend 910B2 nodes,
-Qwen3-32B, four independent Prefillers, four independent Decoders, and TP2 for
-each instance.
+Qwen3-32B, four independent Prefill Pods, four independent Decode Pods, and
+one TP2 process per Pod.
 
 ```bash
 cd deploy/kubernetes/qwen3-32b-4p4d-tp2
@@ -148,7 +148,7 @@ bash deploy.sh all
 ```
 
 See the deployment-specific [README](deploy/kubernetes/qwen3-32b-4p4d-tp2/README.md)
-before applying privileged Pods to a cluster.
+before applying the non-privileged workload Pods to a cluster.
 
 ## Reproducible A/B/C comparison
 
@@ -199,4 +199,3 @@ comparison rules are documented in
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [UPSTREAM.md](UPSTREAM.md).
-

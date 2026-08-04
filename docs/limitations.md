@@ -39,14 +39,13 @@ and TTFT, not from a model name alone.
 
 ## The initial K8s deployment is hardware-specific
 
-The supplied manifests assume two 8-NPU Ascend 910B2 nodes, four TP2 instances
-per role, specific driver hostPaths and Mooncake Ascend Direct. They require a
-privileged security context. Review and adapt them before use in another
-cluster.
+The supplied manifests assume two 8-NPU Ascend 910B2 nodes, four non-privileged
+TP2 Pods per role, specific driver hostPaths and Mooncake Ascend Direct. They
+require an Ascend device plugin/runtime that injects the allocated device nodes
+into workload Pods. Review and adapt them before use in another cluster.
 
 ## Experimental support policy
 
 The repository is not an official vllm-ascend distribution. Pin the exact
 vLLM, vllm-ascend, image, CANN and driver combination used by an experiment.
 Re-run correctness and performance tests after every upstream rebase.
-

@@ -52,9 +52,8 @@ spec:
                   fieldPath: metadata.name
             - {name: NIC_NAME, value: "__NIC_NAME__"}
             - {name: DEVICE_COUNT, value: "2"}
-            - {name: INSTANCE_COUNT, value: "1"}
             - {name: TP_SIZE, value: "2"}
-            - {name: PORT_START, value: "7100"}
+            - {name: HTTP_PORT, value: "7100"}
             - {name: MOONCAKE_KV_PORT, value: "30000"}
             - {name: MODEL_PATH, value: "__MODEL_PATH__"}
             - {name: SERVED_MODEL_NAME, value: "__SERVED_MODEL_NAME__"}
