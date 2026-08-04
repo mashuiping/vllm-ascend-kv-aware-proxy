@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-prefill
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: pd-prefill
+spec:
+  selector:
+    app.kubernetes.io/name: pd-prefill
+  ports:
+    - {name: p0, port: 7100, targetPort: 7100}
+    - {name: p1, port: 7101, targetPort: 7101}
+    - {name: p2, port: 7102, targetPort: 7102}
+    - {name: p3, port: 7103, targetPort: 7103}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-prefill
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pd-prefill
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pd-prefill
+      annotations:
+        pd.openai.com/restarted-at: "__RESTART_TOKEN__"
+    spec:
+      nodeName: "__PREFILL_NODE__"
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: prefiller
+          image: "__VLLM_IMAGE__"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command: ["/bin/bash", "/opt/pd/launch_role.sh"]
+          env:
+            - {name: ROLE, value: "prefill"}
+            - {name: NIC_NAME, value: "__NIC_NAME__"}
+            - {name: DEVICE_COUNT, value: "8"}
+            - {name: INSTANCE_COUNT, value: "4"}
+            - {name: TP_SIZE, value: "2"}
+            - {name: PORT_START, value: "7100"}
+            - {name: MOONCAKE_KV_PORT, value: "30000"}
+            - {name: MODEL_PATH, value: "__MODEL_PATH__"}
+            - {name: SERVED_MODEL_NAME, value: "__SERVED_MODEL_NAME__"}
+            - {name: MAX_MODEL_LEN, value: "__MAX_MODEL_LEN__"}
+            - {name: MAX_NUM_BATCHED_TOKENS, value: "__PREFILL_MAX_BATCHED_TOKENS__"}
+            - {name: MAX_NUM_SEQS, value: "__PREFILL_MAX_NUM_SEQS__"}
+            - {name: GPU_MEMORY_UTILIZATION, value: "__GPU_MEMORY_UTILIZATION__"}
+            - {name: REASONING_PARSER, value: "__REASONING_PARSER__"}
+          resources:
+            requests:
+              __NPU_RESOURCE__: "8"
+            limits:
+              __NPU_RESOURCE__: "8"
+          startupProbe:
+            exec:
+              command: ["/bin/bash", "-ec", "test -f /tmp/pd-ready"]
+            periodSeconds: 5
+            failureThreshold: 720
+          readinessProbe:
+            exec:
+              command: ["/bin/bash", "-ec", "test -f /tmp/pd-ready"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/bash", "-ec", "test -f /tmp/pd-ready"]
+            periodSeconds: 15
+            failureThreshold: 4
+          volumeMounts:
+            - {name: launcher, mountPath: /opt/pd, readOnly: true}
+            - {name: models, mountPath: /models, readOnly: true}
+            - {name: dcmi, mountPath: /usr/local/dcmi, readOnly: true}
+            - {name: hccn-tool, mountPath: /usr/local/Ascend/driver/tools/hccn_tool, readOnly: true}
+            - {name: npu-smi, mountPath: /usr/local/bin/npu-smi, readOnly: true}
+            - {name: driver-lib64, mountPath: /usr/local/Ascend/driver/lib64, readOnly: true}
+            - {name: driver-version, mountPath: /usr/local/Ascend/driver/version.info, readOnly: true}
+            - {name: ascend-install-info, mountPath: /etc/ascend_install.info, readOnly: true}
+            - {name: hccn-config, mountPath: /etc/hccn.conf, readOnly: true}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - name: launcher
+          configMap:
+            name: pd-launcher
+            defaultMode: 0755
+        - name: models
+          hostPath:
+            path: "__MODEL_HOST_PATH__"
+            type: Directory
+        - name: dcmi
+          hostPath:
+            path: /usr/local/dcmi
+            type: Directory
+        - name: hccn-tool
+          hostPath:
+            path: /usr/local/Ascend/driver/tools/hccn_tool
+            type: File
+        - name: npu-smi
+          hostPath:
+            path: /usr/local/bin/npu-smi
+            type: File
+        - name: driver-lib64
+          hostPath:
+            path: /usr/local/Ascend/driver/lib64
+            type: Directory
+        - name: driver-version
+          hostPath:
+            path: /usr/local/Ascend/driver/version.info
+            type: File
+        - name: ascend-install-info
+          hostPath:
+            path: /etc/ascend_install.info
+            type: File
+        - name: hccn-config
+          hostPath:
+            path: /etc/hccn.conf
+            type: File
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Raw benchmark output can be large and may contain request content. Publish
+# only reviewed, redacted summaries under results/published/.
+results/runs/
+

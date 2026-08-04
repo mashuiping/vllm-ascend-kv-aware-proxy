@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ACTION="${1:-all}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
+PROXY_VARIANT="${PROXY_VARIANT:-candidate}"
+KV_AWARE_ROUTING="${KV_AWARE_ROUTING:-true}"
+SESSION_LRU_SIZE="${SESSION_LRU_SIZE:-4096}"
+PREFIX_HASH_CHARS="${PREFIX_HASH_CHARS:-1024}"
+PREFIX_LRU_SIZE="${PREFIX_LRU_SIZE:-1024}"
+
+case "${PROXY_VARIANT}" in
+  candidate)
+    DEFAULT_PROXY_SOURCE_PATH="${REPO_ROOT}/load_balance_proxy_server_example.py"
+    ;;
+  baseline)
+    DEFAULT_PROXY_SOURCE_PATH="${REPO_ROOT}/baseline/load_balance_proxy_server_example.py"
+    ;;
+  *)
+    echo "PROXY_VARIANT must be candidate or baseline: ${PROXY_VARIANT}" >&2
+    exit 2
+    ;;
+esac
+PROXY_SOURCE_PATH="${PROXY_SOURCE_PATH:-${DEFAULT_PROXY_SOURCE_PATH}}"
+
+NAMESPACE="${NAMESPACE:-qwen-pd}"
+VLLM_IMAGE="${VLLM_IMAGE:-quay.io/ascend/vllm-ascend:v0.18.0}"
+MODEL_HOST_PATH="${MODEL_HOST_PATH:-/models}"
+MODEL_PATH="${MODEL_PATH:-/models/Qwen/Qwen3-32B}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-32b}"
+NPU_RESOURCE="${NPU_RESOURCE:-huawei.com/Ascend910}"
+NIC_NAME="${NIC_NAME:-eth0}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+PREFILL_MAX_BATCHED_TOKENS="${PREFILL_MAX_BATCHED_TOKENS:-4096}"
+DECODE_MAX_BATCHED_TOKENS="${DECODE_MAX_BATCHED_TOKENS:-512}"
+PREFILL_MAX_NUM_SEQS="${PREFILL_MAX_NUM_SEQS:-32}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-64}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+REASONING_PARSER="${REASONING_PARSER:-qwen3}"
+RESTART_TOKEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  deploy.sh prefill   # start 4 Prefill replicas, each TP2
+  deploy.sh decode    # start 4 Decode replicas, each TP2
+  deploy.sh proxy     # create/update the load-balancing proxy
+  deploy.sh all       # Prefill -> Decode -> Proxy
+  deploy.sh status
+  deploy.sh cleanup-prefill
+  deploy.sh cleanup-decode
+  deploy.sh cleanup-proxy
+  deploy.sh cleanup-all
+
+Required:
+  PREFILL_NODE=<kubernetes node name>  (prefill/proxy/all)
+  DECODE_NODE=<kubernetes node name>   (decode/all)
+
+Supported settings and defaults:
+  NAMESPACE=qwen-pd
+  VLLM_IMAGE=quay.io/ascend/vllm-ascend:v0.18.0
+  PROXY_SOURCE_PATH=<absolute path>/load_balance_proxy_server_example.py
+  PROXY_VARIANT=candidate  # candidate or baseline
+  KV_AWARE_ROUTING=true    # candidate only; true or false
+  SESSION_LRU_SIZE=4096
+  PREFIX_HASH_CHARS=1024
+  PREFIX_LRU_SIZE=1024
+  MODEL_HOST_PATH=/models
+  MODEL_PATH=/models/Qwen/Qwen3-32B
+  SERVED_MODEL_NAME=qwen3-32b
+  NIC_NAME=eth0
+  NPU_RESOURCE=huawei.com/Ascend910
+  MAX_MODEL_LEN=8192
+  PREFILL_MAX_BATCHED_TOKENS=4096
+  DECODE_MAX_BATCHED_TOKENS=512
+  PREFILL_MAX_NUM_SEQS=32
+  DECODE_MAX_NUM_SEQS=64
+  GPU_MEMORY_UTILIZATION=0.90
+  REASONING_PARSER=qwen3
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required command: $1" >&2
+    exit 2
+  }
+}
+
+require_value() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    echo "${name} is required" >&2
+    usage
+    exit 2
+  fi
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'
+}
+
+render() {
+  local file="$1"
+  sed \
+    -e "s|__NAMESPACE__|$(escape_sed_replacement "${NAMESPACE}")|g" \
+    -e "s|__PREFILL_NODE__|$(escape_sed_replacement "${PREFILL_NODE:-}")|g" \
+    -e "s|__DECODE_NODE__|$(escape_sed_replacement "${DECODE_NODE:-}")|g" \
+    -e "s|__VLLM_IMAGE__|$(escape_sed_replacement "${VLLM_IMAGE}")|g" \
+    -e "s|__MODEL_HOST_PATH__|$(escape_sed_replacement "${MODEL_HOST_PATH}")|g" \
+    -e "s|__MODEL_PATH__|$(escape_sed_replacement "${MODEL_PATH}")|g" \
+    -e "s|__SERVED_MODEL_NAME__|$(escape_sed_replacement "${SERVED_MODEL_NAME}")|g" \
+    -e "s|__NPU_RESOURCE__|$(escape_sed_replacement "${NPU_RESOURCE}")|g" \
+    -e "s|__NIC_NAME__|$(escape_sed_replacement "${NIC_NAME}")|g" \
+    -e "s|__MAX_MODEL_LEN__|$(escape_sed_replacement "${MAX_MODEL_LEN}")|g" \
+    -e "s|__PREFILL_MAX_BATCHED_TOKENS__|$(escape_sed_replacement "${PREFILL_MAX_BATCHED_TOKENS}")|g" \
+    -e "s|__DECODE_MAX_BATCHED_TOKENS__|$(escape_sed_replacement "${DECODE_MAX_BATCHED_TOKENS}")|g" \
+    -e "s|__PREFILL_MAX_NUM_SEQS__|$(escape_sed_replacement "${PREFILL_MAX_NUM_SEQS}")|g" \
+    -e "s|__DECODE_MAX_NUM_SEQS__|$(escape_sed_replacement "${DECODE_MAX_NUM_SEQS}")|g" \
+    -e "s|__GPU_MEMORY_UTILIZATION__|$(escape_sed_replacement "${GPU_MEMORY_UTILIZATION}")|g" \
+    -e "s|__REASONING_PARSER__|$(escape_sed_replacement "${REASONING_PARSER}")|g" \
+    -e "s|__PROXY_VARIANT__|$(escape_sed_replacement "${PROXY_VARIANT}")|g" \
+    -e "s|__KV_AWARE_ROUTING__|$(escape_sed_replacement "${KV_AWARE_ROUTING}")|g" \
+    -e "s|__SESSION_LRU_SIZE__|$(escape_sed_replacement "${SESSION_LRU_SIZE}")|g" \
+    -e "s|__PREFIX_HASH_CHARS__|$(escape_sed_replacement "${PREFIX_HASH_CHARS}")|g" \
+    -e "s|__PREFIX_LRU_SIZE__|$(escape_sed_replacement "${PREFIX_LRU_SIZE}")|g" \
+    -e "s|__RESTART_TOKEN__|$(escape_sed_replacement "${RESTART_TOKEN}")|g" \
+    "${file}"
+}
+
+validate_proxy_source() {
+  case "${KV_AWARE_ROUTING}" in
+    true|false) ;;
+    *)
+      echo "KV_AWARE_ROUTING must be true or false: ${KV_AWARE_ROUTING}" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "${PROXY_VARIANT}" == "baseline" && "${KV_AWARE_ROUTING}" != "false" ]]; then
+    echo "KV_AWARE_ROUTING must be false when PROXY_VARIANT=baseline" >&2
+    exit 2
+  fi
+  if [[ "${PROXY_SOURCE_PATH}" != /* ]]; then
+    echo "PROXY_SOURCE_PATH must be an absolute path: ${PROXY_SOURCE_PATH}" >&2
+    exit 2
+  fi
+  if [[ ! -f "${PROXY_SOURCE_PATH}" ]]; then
+    echo "proxy source not found: ${PROXY_SOURCE_PATH}" >&2
+    exit 2
+  fi
+}
+
+apply_namespace() {
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+}
+
+apply_launcher_config() {
+  kubectl -n "${NAMESPACE}" create configmap pd-launcher \
+    --from-file=launch_role.sh="${SCRIPT_DIR}/launch_role.sh" \
+    --from-file=launch_proxy.sh="${SCRIPT_DIR}/launch_proxy.sh" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
+apply_proxy_config() {
+  kubectl -n "${NAMESPACE}" create configmap pd-proxy-code \
+    --from-file=load_balance_proxy_server_example.py="${PROXY_SOURCE_PATH}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
+apply_prefill() {
+  require_value PREFILL_NODE
+  kubectl get node "${PREFILL_NODE}" >/dev/null
+  render "${SCRIPT_DIR}/prefill.yaml" | kubectl apply -f -
+  kubectl -n "${NAMESPACE}" rollout status deployment/pd-prefill --timeout=60m
+}
+
+apply_decode() {
+  require_value DECODE_NODE
+  kubectl get node "${DECODE_NODE}" >/dev/null
+  render "${SCRIPT_DIR}/decode.yaml" | kubectl apply -f -
+  kubectl -n "${NAMESPACE}" rollout status deployment/pd-decode --timeout=60m
+}
+
+apply_proxy() {
+  require_value PREFILL_NODE
+  render "${SCRIPT_DIR}/proxy.yaml" | kubectl apply -f -
+  kubectl -n "${NAMESPACE}" rollout status deployment/pd-proxy --timeout=10m
+}
+
+show_status() {
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "namespace ${NAMESPACE} does not exist"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" get pods,services -o wide
+  if kubectl -n "${NAMESPACE}" get service pd-proxy >/dev/null 2>&1; then
+    echo
+    echo "Access locally:"
+    echo "  kubectl -n ${NAMESPACE} port-forward service/pd-proxy 8000:8000"
+  fi
+}
+
+cleanup_prefill() {
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "namespace ${NAMESPACE} does not exist; nothing to clean"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" delete \
+    deployment/pd-prefill \
+    service/pd-prefill \
+    --ignore-not-found=true \
+    --wait=true \
+    --timeout=5m
+}
+
+cleanup_decode() {
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "namespace ${NAMESPACE} does not exist; nothing to clean"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" delete \
+    deployment/pd-decode \
+    service/pd-decode \
+    --ignore-not-found=true \
+    --wait=true \
+    --timeout=5m
+}
+
+cleanup_proxy() {
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "namespace ${NAMESPACE} does not exist; nothing to clean"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" delete \
+    deployment/pd-proxy \
+    service/pd-proxy \
+    configmap/pd-proxy-code \
+    --ignore-not-found=true \
+    --wait=true \
+    --timeout=5m
+}
+
+cleanup_all() {
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "namespace ${NAMESPACE} does not exist; nothing to clean"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" delete \
+    deployment/pd-prefill \
+    deployment/pd-decode \
+    deployment/pd-proxy \
+    service/pd-prefill \
+    service/pd-decode \
+    service/pd-proxy \
+    configmap/pd-launcher \
+    configmap/pd-proxy-code \
+    --ignore-not-found=true \
+    --wait=true \
+    --timeout=5m
+}
+
+require_command kubectl
+
+case "${ACTION}" in
+  prefill)
+    require_value VLLM_IMAGE
+    apply_namespace
+    apply_launcher_config
+    apply_prefill
+    ;;
+  decode)
+    require_value VLLM_IMAGE
+    apply_namespace
+    apply_launcher_config
+    apply_decode
+    ;;
+  proxy)
+    require_value VLLM_IMAGE
+    validate_proxy_source
+    apply_namespace
+    apply_launcher_config
+    apply_proxy_config
+    apply_proxy
+    ;;
+  all)
+    require_value VLLM_IMAGE
+    require_value PREFILL_NODE
+    require_value DECODE_NODE
+    if [[ "${PREFILL_NODE}" == "${DECODE_NODE}" ]]; then
+      echo "PREFILL_NODE and DECODE_NODE must be different for this 4P4D TP2 layout" >&2
+      exit 2
+    fi
+    validate_proxy_source
+    apply_namespace
+    apply_launcher_config
+    apply_prefill
+    apply_decode
+    apply_proxy_config
+    apply_proxy
+    show_status
+    ;;
+  status)
+    show_status
+    ;;
+  cleanup-prefill)
+    cleanup_prefill
+    ;;
+  cleanup-decode)
+    cleanup_decode
+    ;;
+  cleanup-proxy)
+    cleanup_proxy
+    ;;
+  cleanup-all)
+    cleanup_all
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "unknown action: ${ACTION}" >&2
+    usage
+    exit 2
+    ;;
+esac

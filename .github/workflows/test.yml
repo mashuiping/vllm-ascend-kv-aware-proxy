@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Unit tests
+        run: python -m pytest
+      - name: Ruff lint
+        run: python -m ruff check load_balance_proxy_server_example.py scripts tests
+      - name: Ruff format
+        run: python -m ruff format --check load_balance_proxy_server_example.py scripts tests
+      - name: Compile proxy snapshots
+        run: |
+          python -m py_compile load_balance_proxy_server_example.py
+          python -m py_compile baseline/load_balance_proxy_server_example.py
+      - name: Validate shell syntax
+        run: |
+          bash -n scripts/run_experiment.sh
+          bash -n deploy/kubernetes/qwen3-32b-4p4d-tp2/deploy.sh
+          bash -n deploy/kubernetes/qwen3-32b-4p4d-tp2/launch_role.sh
+          bash -n deploy/kubernetes/qwen3-32b-4p4d-tp2/launch_proxy.sh
+

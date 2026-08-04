@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+"""Benchmark session-affinity routing against an OpenAI-compatible PD proxy.
+
+The workload advances all sessions one turn at a time. This preserves
+conversation order within a session while allowing independent sessions to run
+concurrently. Besides per-request latency, the script can sample the proxy
+health endpoint and every P/D vLLM /metrics endpoint.
+
+Example:
+  OPENAI_API_KEY=... python scripts/benchmark_session_affinity.py \
+    --base-url http://proxy:9000 \
+    --model glm5.1 \
+    --scenario session-long \
+    --sessions 256 --turns 6 --concurrency 64 \
+    --prefix-words 8192 --max-tokens 16 \
+    --prefill-metrics-url http://p0:7100/metrics \
+    --prefill-metrics-url http://p1:7100/metrics \
+    --prefill-metrics-url http://p2:7100/metrics \
+    --prefill-metrics-url http://p3:7100/metrics \
+    --decode-metrics-url http://d0:7200/metrics \
+    --output-dir results/affinity-on
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import random
+import re
+import statistics
+import threading
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin
+
+import requests
+from requests.adapters import HTTPAdapter
+
+PROMETHEUS_LINE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>.*)\})?\s+"
+    r"(?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|NaN|[+-]Inf)"
+)
+
+INTERESTING_METRIC_PREFIXES = (
+    "vllm:prefix_cache_queries",
+    "vllm:prefix_cache_hits",
+    "vllm:prompt_tokens",
+    "vllm:request_prefill_kv_computed_tokens",
+    "vllm:request_prefill_time_seconds",
+    "vllm:request_queue_time_seconds",
+    "vllm:time_to_first_token_seconds",
+    "vllm:e2e_request_latency_seconds",
+    "vllm:kv_cache_usage_perc",
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:request_success",
+)
+
+
+@dataclass
+class RequestResult:
+    session_index: int
+    session_id: str
+    turn: int
+    scenario: str
+    status_code: int | None
+    ok: bool
+    ttfb_ms: float | None
+    ttft_ms: float | None
+    e2e_ms: float
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    client_cached_tokens: int | None
+    output_chars: int
+    error: str | None
+
+
+class JsonlWriter:
+    def __init__(self, path: Path):
+        self._file = path.open("w", encoding="utf-8")
+        self._lock = threading.Lock()
+
+    def write(self, value: Any) -> None:
+        with self._lock:
+            self._file.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+            self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * quantile
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
+
+
+def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
+    successful = [result for result in results if result.ok]
+    ttft = [result.ttft_ms for result in successful if result.ttft_ms is not None]
+    ttfb = [result.ttfb_ms for result in successful if result.ttfb_ms is not None]
+    e2e = [result.e2e_ms for result in successful]
+    prompt_tokens = [float(result.prompt_tokens) for result in successful if result.prompt_tokens is not None]
+    cached_tokens = [
+        float(result.client_cached_tokens) for result in successful if result.client_cached_tokens is not None
+    ]
+
+    def describe(values: list[float]) -> dict[str, float | int | None]:
+        return {
+            "count": len(values),
+            "mean": statistics.fmean(values) if values else None,
+            "p50": percentile(values, 0.50),
+            "p90": percentile(values, 0.90),
+            "p95": percentile(values, 0.95),
+            "p99": percentile(values, 0.99),
+            "max": max(values) if values else None,
+        }
+
+    return {
+        "requests": len(results),
+        "successes": len(successful),
+        "errors": len(results) - len(successful),
+        "success_rate": len(successful) / len(results) if results else 0.0,
+        "ttfb_ms": describe(ttfb),
+        "ttft_ms": describe(ttft),
+        "e2e_ms": describe(e2e),
+        "prompt_tokens": describe(prompt_tokens),
+        "client_cached_tokens": describe(cached_tokens),
+    }
+
+
+def parse_prometheus(text: str) -> dict[str, float]:
+    """Aggregate each metric name across labels.
+
+    Histograms remain split into their standard _bucket, _sum, and _count
+    series. Per-backend attribution is preserved by storing every URL
+    separately in the result files.
+    """
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = PROMETHEUS_LINE.match(line)
+        if match is None:
+            continue
+        name = match.group("name")
+        if not name.startswith(INTERESTING_METRIC_PREFIXES):
+            continue
+        try:
+            value = float(match.group("value"))
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            totals[name] = totals.get(name, 0.0) + value
+    return totals
+
+
+def counter_delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for name in sorted(set(before) | set(after)):
+        if name.endswith(("_bucket", "_sum", "_count")) or name in (
+            "vllm:prefix_cache_queries",
+            "vllm:prefix_cache_hits",
+            "vllm:prompt_tokens",
+            "vllm:prompt_tokens_cached",
+            "vllm:request_success",
+        ):
+            result[name] = after.get(name, 0.0) - before.get(name, 0.0)
+    queries = result.get("vllm:prefix_cache_queries", 0.0)
+    hits = result.get("vllm:prefix_cache_hits", 0.0)
+    if queries > 0:
+        result["derived:prefix_cache_hit_rate"] = hits / queries
+    computed_sum = result.get("vllm:request_prefill_kv_computed_tokens_sum", 0.0)
+    computed_count = result.get("vllm:request_prefill_kv_computed_tokens_count", 0.0)
+    if computed_count > 0:
+        result["derived:mean_prefill_computed_tokens"] = computed_sum / computed_count
+    for metric in (
+        "vllm:request_prefill_time_seconds",
+        "vllm:request_queue_time_seconds",
+        "vllm:time_to_first_token_seconds",
+        "vllm:e2e_request_latency_seconds",
+    ):
+        count = result.get(f"{metric}_count", 0.0)
+        if count > 0:
+            result[f"derived:mean:{metric}"] = result.get(f"{metric}_sum", 0.0) / count
+    return result
+
+
+def aggregate_metric_snapshots(
+    urls: list[str],
+    snapshots: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    aggregate: dict[str, float] = {}
+    for url in urls:
+        for name, value in snapshots.get(url, {}).items():
+            aggregate[name] = aggregate.get(name, 0.0) + value
+    return aggregate
+
+
+class EndpointSampler:
+    def __init__(
+        self,
+        health_url: str | None,
+        metrics_urls: list[str],
+        interval: float,
+        timeout: float,
+        verify: bool,
+        writer: JsonlWriter,
+    ):
+        self.health_url = health_url
+        self.metrics_urls = metrics_urls
+        self.interval = interval
+        self.timeout = timeout
+        self.verify = verify
+        self.writer = writer
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.before: dict[str, dict[str, float]] = {}
+        self.after: dict[str, dict[str, float]] = {}
+
+    def _get_health(self) -> dict[str, Any] | None:
+        if not self.health_url:
+            return None
+        response = requests.get(
+            self.health_url,
+            timeout=self.timeout,
+            verify=self.verify,
+        )
+        response.raise_for_status()
+        value = response.json()
+        return value if isinstance(value, dict) else {"value": value}
+
+    def _get_metric(self, url: str) -> tuple[str, dict[str, float], str]:
+        response = requests.get(url, timeout=self.timeout, verify=self.verify)
+        response.raise_for_status()
+        return url, parse_prometheus(response.text), response.text
+
+    def snapshot_metrics(self, raw_dir: Path, suffix: str) -> dict[str, dict[str, float]]:
+        snapshots: dict[str, dict[str, float]] = {}
+        for index, url in enumerate(self.metrics_urls):
+            try:
+                metric_url, parsed, raw = self._get_metric(url)
+                snapshots[metric_url] = parsed
+                (raw_dir / f"metrics-{index:02d}-{suffix}.prom").write_text(
+                    raw,
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                self.writer.write(
+                    {
+                        "timestamp": time.time(),
+                        "kind": "metrics_error",
+                        "url": url,
+                        "error": repr(exc),
+                    }
+                )
+        return snapshots
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            timestamp = time.time()
+            if self.health_url:
+                try:
+                    self.writer.write(
+                        {
+                            "timestamp": timestamp,
+                            "kind": "proxy_health",
+                            "url": self.health_url,
+                            "value": self._get_health(),
+                        }
+                    )
+                except Exception as exc:
+                    self.writer.write(
+                        {
+                            "timestamp": timestamp,
+                            "kind": "health_error",
+                            "url": self.health_url,
+                            "error": repr(exc),
+                        }
+                    )
+            for url in self.metrics_urls:
+                try:
+                    metric_url, parsed, _ = self._get_metric(url)
+                    gauges = {
+                        name: value
+                        for name, value in parsed.items()
+                        if name
+                        in (
+                            "vllm:kv_cache_usage_perc",
+                            "vllm:num_requests_running",
+                            "vllm:num_requests_waiting",
+                        )
+                    }
+                    self.writer.write(
+                        {
+                            "timestamp": timestamp,
+                            "kind": "vllm_gauges",
+                            "url": metric_url,
+                            "value": gauges,
+                        }
+                    )
+                except Exception as exc:
+                    self.writer.write(
+                        {
+                            "timestamp": timestamp,
+                            "kind": "metrics_error",
+                            "url": url,
+                            "error": repr(exc),
+                        }
+                    )
+
+    def start(self, raw_dir: Path) -> None:
+        self.before = self.snapshot_metrics(raw_dir, "before")
+        if self.health_url:
+            try:
+                self.writer.write(
+                    {
+                        "timestamp": time.time(),
+                        "kind": "proxy_health",
+                        "url": self.health_url,
+                        "value": self._get_health(),
+                    }
+                )
+            except Exception as exc:
+                self.writer.write(
+                    {
+                        "timestamp": time.time(),
+                        "kind": "health_error",
+                        "url": self.health_url,
+                        "error": repr(exc),
+                    }
+                )
+        if self.health_url or self.metrics_urls:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def stop(self, raw_dir: Path) -> None:
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=max(self.interval * 2, 5.0))
+        if self.health_url:
+            try:
+                self.writer.write(
+                    {
+                        "timestamp": time.time(),
+                        "kind": "proxy_health",
+                        "url": self.health_url,
+                        "value": self._get_health(),
+                    }
+                )
+            except Exception as exc:
+                self.writer.write(
+                    {
+                        "timestamp": time.time(),
+                        "kind": "health_error",
+                        "url": self.health_url,
+                        "error": repr(exc),
+                    }
+                )
+        self.after = self.snapshot_metrics(raw_dir, "after")
+
+
+def make_http_session(concurrency: int) -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=max(concurrency, 16),
+        pool_maxsize=max(concurrency, 16),
+        max_retries=0,
+        pool_block=True,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def read_prefix(args: argparse.Namespace) -> str:
+    if args.prefix_file:
+        return Path(args.prefix_file).read_text(encoding="utf-8")
+    words = [f"cacheword{i % 97:02d}" for i in range(args.prefix_words)]
+    return " ".join(words)
+
+
+def build_initial_messages(
+    scenario: str,
+    session_index: int,
+    common_prefix: str,
+) -> list[dict[str, str]]:
+    marker = f"session-marker-{session_index:08d}"
+    if scenario in ("shared-prefix", "hot-key", "hot-prefix"):
+        system = f"{common_prefix}\nFollow the instructions carefully."
+        first_user = f"{marker}\nSummarize the stable document in one short sentence."
+    elif scenario == "short":
+        system = f"{marker}\nYou are a concise assistant."
+        first_user = "Reply with one short sentence."
+    elif scenario == "one-shot":
+        system = f"{marker}\n{common_prefix}"
+        first_user = "Give one short observation about this document."
+    else:
+        # Put the marker before the long text so different sessions do not
+        # accidentally share the benchmarked prefix with each other.
+        system = f"{marker}\n{common_prefix}"
+        first_user = "Summarize the stable document in one short sentence."
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": first_user},
+    ]
+
+
+def extract_stream_text(delta: dict[str, Any]) -> str:
+    parts = [
+        delta.get("reasoning"),
+        delta.get("reasoning_content"),
+        delta.get("reasoning_text"),
+        delta.get("content"),
+    ]
+    return "".join(part for part in parts if isinstance(part, str))
+
+
+def send_request(
+    *,
+    http: requests.Session,
+    api_url: str,
+    api_key: str | None,
+    model: str,
+    messages: list[dict[str, str]],
+    session_id: str,
+    session_index: int,
+    turn: int,
+    scenario: str,
+    session_header: str,
+    send_session_key: bool,
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+    verify: bool,
+) -> tuple[RequestResult, str]:
+    headers = {
+        "Accept": "text/event-stream",
+        "Accept-Encoding": "identity",
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if send_session_key:
+        headers[session_header] = session_id
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    started = time.perf_counter()
+    ttfb_ms: float | None = None
+    ttft_ms: float | None = None
+    status_code: int | None = None
+    usage: dict[str, Any] = {}
+    output_parts: list[str] = []
+    error: str | None = None
+    try:
+        with http.post(
+            api_url,
+            json=payload,
+            headers=headers,
+            stream=True,
+            timeout=(30.0, timeout),
+            verify=verify,
+        ) as response:
+            status_code = response.status_code
+            response.raise_for_status()
+            for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
+                if not raw_line:
+                    continue
+                now = time.perf_counter()
+                if ttfb_ms is None:
+                    ttfb_ms = (now - started) * 1000
+                line = str(raw_line)
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                delta = choices[0].get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                text = extract_stream_text(delta)
+                if text:
+                    if ttft_ms is None:
+                        ttft_ms = (now - started) * 1000
+                    output_parts.append(text)
+    except Exception as exc:
+        error = repr(exc)
+
+    ended = time.perf_counter()
+    details = usage.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    output = "".join(output_parts)
+    result = RequestResult(
+        session_index=session_index,
+        session_id=session_id,
+        turn=turn,
+        scenario=scenario,
+        status_code=status_code,
+        ok=error is None and status_code is not None and status_code < 400,
+        ttfb_ms=ttfb_ms,
+        ttft_ms=ttft_ms,
+        e2e_ms=(ended - started) * 1000,
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        client_cached_tokens=details.get("cached_tokens"),
+        output_chars=len(output),
+        error=error,
+    )
+    return result, output
+
+
+def derive_urls(base_url: str) -> tuple[str, str]:
+    normalized = base_url.rstrip("/") + "/"
+    if normalized.endswith("/v1/"):
+        root = normalized[: -len("v1/")]
+        api_url = urljoin(normalized, "chat/completions")
+    else:
+        root = normalized
+        api_url = urljoin(normalized, "v1/chat/completions")
+    return api_url, urljoin(root, "healthcheck")
+
+
+def reset_cache(url: str, api_key: str | None, timeout: float, verify: bool) -> None:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    response = requests.post(url, headers=headers, timeout=timeout, verify=verify)
+    response.raise_for_status()
+
+
+def summarize_health_samples(samples_path: Path) -> dict[str, Any]:
+    spreads: list[float] = []
+    cvs: list[float] = []
+    max_priorities: list[float] = []
+    first_stats_by_field: dict[str, dict[str, int | float]] = {}
+    last_stats_by_field: dict[str, dict[str, int | float]] = {}
+    first_source_stats: dict[str, dict[str, int | float]] = {}
+    last_source_stats: dict[str, dict[str, int | float]] = {}
+    affinity_config: dict[str, int | float] = {}
+
+    def numeric_stats(value: Any) -> dict[str, int | float]:
+        if not isinstance(value, dict):
+            return {}
+        return {name: metric for name, metric in value.items() if isinstance(metric, (int, float))}
+
+    def stats_delta(
+        first: dict[str, int | float],
+        last: dict[str, int | float],
+    ) -> dict[str, int | float]:
+        return {name: last.get(name, 0) - first.get(name, 0) for name in sorted(set(first) | set(last))}
+
+    with samples_path.open(encoding="utf-8") as stream:
+        for line in stream:
+            sample = json.loads(line)
+            if sample.get("kind") != "proxy_health":
+                continue
+            health = sample.get("value") or {}
+            for field in ("session_affinity_stats", "prefix_affinity_stats"):
+                current = numeric_stats(health.get(field))
+                if current:
+                    first_stats_by_field.setdefault(field, current)
+                    last_stats_by_field[field] = current
+            by_source = health.get("prefill_cache_stats_by_source")
+            if isinstance(by_source, dict):
+                for source, value in by_source.items():
+                    current = numeric_stats(value)
+                    if current:
+                        first_source_stats.setdefault(source, current)
+                        last_source_stats[source] = current
+            for field in (
+                "prefix_hash_chars",
+                "prefix_cache_capacity",
+                "prefix_spill_max_nodes",
+                "prefill_kv_weight",
+            ):
+                value = health.get(field)
+                if isinstance(value, (int, float)):
+                    affinity_config[field] = value
+            loads = health.get("prefill_loads") or {}
+            priorities = [
+                float(value["priority"])
+                for value in loads.values()
+                if isinstance(value, dict) and isinstance(value.get("priority"), (int, float))
+            ]
+            if not priorities:
+                continue
+            spreads.append(max(priorities) - min(priorities))
+            max_priorities.append(max(priorities))
+            mean = statistics.fmean(priorities)
+            cvs.append(statistics.pstdev(priorities) / mean if mean > 0 else 0.0)
+
+    session_delta = stats_delta(
+        first_stats_by_field.get("session_affinity_stats", {}),
+        last_stats_by_field.get("session_affinity_stats", {}),
+    )
+    if session_delta:
+        lookups = session_delta.get("lookups", 0)
+        if lookups:
+            session_delta["derived_affinity_hit_rate"] = session_delta.get("hits", 0) / lookups
+            session_delta["derived_overload_fallback_rate"] = session_delta.get("overload_fallbacks", 0) / lookups
+        prompt_tokens = session_delta.get("prompt_tokens", 0)
+        if prompt_tokens:
+            session_delta["derived_cached_token_rate"] = session_delta.get("cached_tokens", 0) / prompt_tokens
+
+    prefix_delta = stats_delta(
+        first_stats_by_field.get("prefix_affinity_stats", {}),
+        last_stats_by_field.get("prefix_affinity_stats", {}),
+    )
+    if prefix_delta:
+        lookups = prefix_delta.get("lookups", 0)
+        if lookups:
+            prefix_delta["derived_prefix_hit_rate"] = prefix_delta.get("hits", 0) / lookups
+            prefix_delta["derived_spillover_rate"] = prefix_delta.get("spillover_routes", 0) / lookups
+
+    source_deltas = {
+        source: stats_delta(first_source_stats.get(source, {}), last) for source, last in last_source_stats.items()
+    }
+    for delta in source_deltas.values():
+        prompt_tokens = delta.get("prompt_tokens", 0)
+        if prompt_tokens:
+            delta["derived_cached_token_rate"] = delta.get("cached_tokens", 0) / prompt_tokens
+
+    return {
+        "samples": len(spreads),
+        "priority_spread_p50": percentile(spreads, 0.50),
+        "priority_spread_p95": percentile(spreads, 0.95),
+        "priority_cv_p50": percentile(cvs, 0.50),
+        "priority_cv_p95": percentile(cvs, 0.95),
+        "max_priority_p95": percentile(max_priorities, 0.95),
+        "affinity_config": affinity_config,
+        "session_affinity_stats_delta": session_delta,
+        "prefix_affinity_stats_delta": prefix_delta,
+        "prefill_cache_stats_by_source_delta": source_deltas,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True, help="Proxy root URL or its /v1 URL.")
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--scenario",
+        choices=(
+            "session-long",
+            "short",
+            "one-shot",
+            "shared-prefix",
+            "hot-key",
+            "hot-prefix",
+            "churn",
+        ),
+        default="session-long",
+    )
+    parser.add_argument("--sessions", type=int, default=256)
+    parser.add_argument("--turns", type=int, default=6)
+    parser.add_argument("--concurrency", type=int, default=64)
+    parser.add_argument("--prefix-words", type=int, default=8192)
+    parser.add_argument("--prefix-file", help="Use a real stable prefix instead of generated words.")
+    parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--think-time", type=float, default=0.0)
+    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument("--session-header", default="x-session-id")
+    parser.add_argument("--no-session-key", action="store_true")
+    parser.add_argument(
+        "--api-key-env",
+        default="OPENAI_API_KEY",
+        help="Environment variable containing the API key; never written to results.",
+    )
+    parser.add_argument("--health-url", help="Proxy /healthcheck; derived from base URL by default.")
+    parser.add_argument("--no-health-sampling", action="store_true")
+    parser.add_argument("--prefill-metrics-url", action="append", default=[])
+    parser.add_argument("--decode-metrics-url", action="append", default=[])
+    parser.add_argument(
+        "--metrics-url",
+        action="append",
+        default=[],
+        help="Additional unclassified vLLM metrics endpoint.",
+    )
+    parser.add_argument("--reset-before", action="store_true")
+    parser.add_argument("--reset-url", help="Proxy reset endpoint; derived by default.")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
+    parser.add_argument("--seed", type=int, default=20260724)
+    parser.add_argument("--label", default="session-affinity")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--compare-with",
+        help="Existing baseline summary.json; writes comparison.json for this run.",
+    )
+    args = parser.parse_args()
+    if args.sessions <= 0 or args.turns <= 0 or args.concurrency <= 0:
+        parser.error("sessions, turns, and concurrency must be positive")
+    if args.scenario == "one-shot":
+        args.turns = 1
+    return args
+
+
+def nested_number(value: dict[str, Any], path: str) -> float | None:
+    current: Any = value
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return float(current) if isinstance(current, (int, float)) else None
+
+
+def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> dict[str, Any]:
+    paths = (
+        "warm_turns.ttft_ms.p50",
+        "warm_turns.ttft_ms.p95",
+        "warm_turns.ttft_ms.p99",
+        "warm_turns.e2e_ms.p95",
+        "overall.success_rate",
+        "metrics_delta_by_role.prefill.derived:prefix_cache_hit_rate",
+        "metrics_delta_by_role.prefill.derived:mean_prefill_computed_tokens",
+        "metrics_delta_by_role.prefill.derived:mean:vllm:request_prefill_time_seconds",
+        "metrics_delta_by_role.prefill.derived:mean:vllm:request_queue_time_seconds",
+        "metrics_delta_by_role.decode.derived:mean:vllm:request_queue_time_seconds",
+        "proxy_prefill_load_balance.priority_cv_p95",
+        ("proxy_prefill_load_balance.session_affinity_stats_delta." "derived_overload_fallback_rate"),
+        ("proxy_prefill_load_balance.prefix_affinity_stats_delta." "derived_prefix_hit_rate"),
+        ("proxy_prefill_load_balance.prefix_affinity_stats_delta." "derived_spillover_rate"),
+    )
+    comparison: dict[str, Any] = {}
+    lower_is_better = (
+        "ttft",
+        "e2e",
+        "computed_tokens",
+        "prefill_time",
+        "queue_time",
+        "priority_cv",
+        "fallback_rate",
+        "spillover_rate",
+    )
+    for path in paths:
+        before = nested_number(baseline, path)
+        after = nested_number(treatment, path)
+        if before is None or after is None:
+            continue
+        if before == 0:
+            relative_change = None
+            improvement = None
+        else:
+            relative_change = (after - before) / before
+            improvement = (
+                (before - after) / before
+                if any(name in path for name in lower_is_better)
+                else (after - before) / before
+            )
+        comparison[path] = {
+            "baseline": before,
+            "treatment": after,
+            "relative_change": relative_change,
+            "improvement": improvement,
+        }
+    return comparison
+
+
+def main() -> int:
+    args = parse_args()
+    random.seed(args.seed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    requests_writer = JsonlWriter(output_dir / "requests.jsonl")
+    samples_path = output_dir / "samples.jsonl"
+    samples_writer = JsonlWriter(samples_path)
+    api_url, derived_health_url = derive_urls(args.base_url)
+    health_url = None if args.no_health_sampling else (args.health_url or derived_health_url)
+    root_url = args.base_url.rstrip("/")
+    if root_url.endswith("/v1"):
+        root_url = root_url[:-3].rstrip("/")
+    reset_url = args.reset_url or f"{root_url}/reset_prefix_cache"
+    api_key = os.environ.get(args.api_key_env)
+    verify = not args.insecure
+
+    config = vars(args).copy()
+    config["api_url"] = api_url
+    config["health_url"] = health_url
+    config["reset_url"] = reset_url
+    config["api_key_present"] = bool(api_key)
+    config.pop("api_key_env", None)
+    (output_dir / "config.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    if args.reset_before:
+        reset_cache(reset_url, api_key, args.timeout, verify)
+
+    all_metrics_urls = list(dict.fromkeys(args.prefill_metrics_url + args.decode_metrics_url + args.metrics_url))
+    sampler = EndpointSampler(
+        health_url=health_url,
+        metrics_urls=all_metrics_urls,
+        interval=args.sample_interval,
+        timeout=min(args.timeout, 30.0),
+        verify=verify,
+        writer=samples_writer,
+    )
+    sampler.start(output_dir)
+
+    common_prefix = read_prefix(args)
+    histories = [build_initial_messages(args.scenario, index, common_prefix) for index in range(args.sessions)]
+    session_ids = [f"bench-{args.seed}-{index}-{uuid.uuid4().hex[:8]}" for index in range(args.sessions)]
+    if args.scenario == "hot-key":
+        session_ids = [f"bench-hot-key-{args.seed}"] * args.sessions
+
+    all_results: list[RequestResult] = []
+    thread_local = threading.local()
+
+    def warm_hot_prefix() -> None:
+        warmup_http = make_http_session(1)
+        try:
+            warmup_result, _ = send_request(
+                http=warmup_http,
+                api_url=api_url,
+                api_key=api_key,
+                model=args.model,
+                messages=build_initial_messages("hot-prefix", -1, common_prefix),
+                session_id=f"bench-hot-prefix-warmup-{args.seed}",
+                session_index=-1,
+                turn=-1,
+                scenario="hot-prefix",
+                session_header=args.session_header,
+                send_session_key=not args.no_session_key,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                timeout=args.timeout,
+                verify=verify,
+            )
+        finally:
+            warmup_http.close()
+        if not warmup_result.ok:
+            raise RuntimeError(f"hot-prefix warm-up failed: {warmup_result.error}")
+
+    def invoke(session_index: int, turn: int) -> tuple[int, RequestResult, str]:
+        if not hasattr(thread_local, "http"):
+            thread_local.http = make_http_session(args.concurrency)
+        session_id = session_ids[session_index]
+        if args.scenario == "hot-prefix":
+            session_id = f"{session_id}-turn-{turn}"
+        result, output = send_request(
+            http=thread_local.http,
+            api_url=api_url,
+            api_key=api_key,
+            model=args.model,
+            messages=histories[session_index],
+            session_id=session_id,
+            session_index=session_index,
+            turn=turn,
+            scenario=args.scenario,
+            session_header=args.session_header,
+            send_session_key=not args.no_session_key,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            timeout=args.timeout,
+            verify=verify,
+        )
+        return session_index, result, output
+
+    started = time.time()
+    try:
+        if args.scenario == "hot-prefix":
+            warm_hot_prefix()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            for turn in range(args.turns):
+                futures = [executor.submit(invoke, index, turn) for index in range(args.sessions)]
+                for future in concurrent.futures.as_completed(futures):
+                    session_index, result, output = future.result()
+                    all_results.append(result)
+                    requests_writer.write(asdict(result))
+                    if result.ok:
+                        histories[session_index].append({"role": "assistant", "content": output or "Acknowledged."})
+                        histories[session_index].append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Turn {turn + 2}: refine the previous answer, " "keeping it to one short sentence."
+                                ),
+                            }
+                        )
+                current = latency_summary([result for result in all_results if result.turn == turn])
+                print(
+                    json.dumps(
+                        {
+                            "turn": turn,
+                            "success_rate": current["success_rate"],
+                            "ttft_p50_ms": current["ttft_ms"]["p50"],
+                            "ttft_p95_ms": current["ttft_ms"]["p95"],
+                            "e2e_p95_ms": current["e2e_ms"]["p95"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                if args.think_time > 0 and turn + 1 < args.turns:
+                    time.sleep(args.think_time)
+    finally:
+        sampler.stop(output_dir)
+        requests_writer.close()
+        samples_writer.close()
+
+    metric_deltas = {
+        url: counter_delta(sampler.before.get(url, {}), sampler.after.get(url, {}))
+        for url in sorted(set(sampler.before) | set(sampler.after))
+    }
+    metric_deltas_by_role = {}
+    for role, urls in (
+        ("prefill", args.prefill_metrics_url),
+        ("decode", args.decode_metrics_url),
+        ("unclassified", args.metrics_url),
+    ):
+        if urls:
+            metric_deltas_by_role[role] = counter_delta(
+                aggregate_metric_snapshots(urls, sampler.before),
+                aggregate_metric_snapshots(urls, sampler.after),
+            )
+    summary = {
+        "label": args.label,
+        "scenario": args.scenario,
+        "wall_time_seconds": time.time() - started,
+        "overall": latency_summary(all_results),
+        "cold_turn": latency_summary([result for result in all_results if result.turn == 0]),
+        "warm_turns": latency_summary([result for result in all_results if result.turn > 0]),
+        "per_turn": {
+            str(turn): latency_summary([result for result in all_results if result.turn == turn])
+            for turn in range(args.turns)
+        },
+        "proxy_prefill_load_balance": summarize_health_samples(samples_path),
+        "metrics_delta_by_role": metric_deltas_by_role,
+        "metrics_delta_by_url": metric_deltas,
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    if args.compare_with:
+        baseline = json.loads(Path(args.compare_with).read_text(encoding="utf-8"))
+        comparison = compare_summaries(baseline, summary)
+        (output_dir / "comparison.json").write_text(
+            json.dumps(comparison, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if summary["overall"]["errors"] == 0 else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
