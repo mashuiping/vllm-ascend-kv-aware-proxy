@@ -344,3 +344,200 @@ def test_complete_prefill_allow_affinity_false_preserves_existing_bindings():
     )
     scheduler.release_prefill_kv(second["key"], 10.0)
     assert scheduler.session_lru["session"] == bound
+
+
+def test_assign_instances_with_gate_off_binds_even_when_reusable_is_zero(monkeypatch):
+    scheduler = make_scheduler()
+    response_payload = {
+        "usage": {
+            "prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0}
+        }
+    }
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.headers = {}
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+            self.base_url = "http://test"
+
+        async def post(self, *args, **kwargs):
+            self.calls += 1
+            return FakeResponse(response_payload)
+
+    async def fake_send_request(client, *_args, **_kwargs):
+        return await client.post()
+
+    class FakeRuntime:
+        def __init__(self):
+            self.scheduler = scheduler
+
+        async def schedule(self, method, *args, **kwargs):
+            method_fn = getattr(scheduler, method)
+            if method == "pick_decoder":
+                return {"key": next(iter(scheduler.decoders)), "host": "127.0.0.1", "port": 8200}
+            return method_fn(*args, **kwargs)
+
+        async def get_client(self, _role, _key):
+            return FakeClient()
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(
+        max_retries=0,
+        retry_delay=0,
+        enable_kv_cache_aware_routing=True,
+        enable_reusable_prefix_affinity_gate=False,
+        prefix_hash_chars=0,
+    ))
+    monkeypatch.setattr(proxy, "send_request_to_service", fake_send_request)
+
+    instance_info = asyncio.run(
+        proxy.assign_instances(
+            "/completions",
+            {"session_id": "s1"},
+            100,
+            is_initial_request=True,
+            session_key=proxy.extract_session_key({}, {"session_id": "s1"}),
+            prefix_key=None,
+        )
+    )
+    scheduler.release_prefill_kv(instance_info.prefiller_key, instance_info.prefiller_score)
+    scheduler.release_decoder(
+        next(iter(scheduler.decoders)),
+        instance_info.decoder_score,
+    )
+    assert "header:x-session-id:s1" in scheduler.session_lru or "body:session_id:s1" in scheduler.session_lru
+
+
+def test_assign_instances_with_gate_on_skips_bind_when_reusable_zero(monkeypatch):
+    scheduler = make_scheduler()
+    response_payload = {
+        "usage": {
+            "prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0}
+        }
+    }
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self):
+            self.base_url = "http://test"
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse(response_payload)
+
+    class FakeRuntime:
+        def __init__(self):
+            self.scheduler = scheduler
+
+        async def schedule(self, method, *args, **kwargs):
+            method_fn = getattr(scheduler, method)
+            if method == "pick_decoder":
+                return {"key": next(iter(scheduler.decoders)), "host": "127.0.0.1", "port": 8200}
+            return method_fn(*args, **kwargs)
+
+        async def get_client(self, _role, _key):
+            return FakeClient()
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(
+        max_retries=0,
+        retry_delay=0,
+        enable_kv_cache_aware_routing=True,
+        enable_reusable_prefix_affinity_gate=True,
+        prefix_hash_chars=0,
+    ))
+    monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
+
+    s_key = "body:session_id:s1"
+    instance_info = asyncio.run(
+        proxy.assign_instances(
+            "/completions",
+            {"session_id": "s1"},
+            100,
+            is_initial_request=True,
+            session_key=s_key,
+            prefix_key=None,
+        )
+    )
+    scheduler.release_prefill_kv(instance_info.prefiller_key, instance_info.prefiller_score)
+    scheduler.release_decoder(
+        next(iter(scheduler.decoders)),
+        instance_info.decoder_score,
+    )
+    assert scheduler.session_lru == {}
+
+
+def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monkeypatch, caplog):
+    scheduler = make_scheduler()
+
+    class FakeResponse:
+        def json(self):
+            return {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+    class FakeClient:
+        def __init__(self):
+            self.base_url = "http://test"
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    class FakeRuntime:
+        def __init__(self):
+            self.scheduler = scheduler
+
+        async def schedule(self, method, *args, **kwargs):
+            method_fn = getattr(scheduler, method)
+            if method == "pick_decoder":
+                return {"key": next(iter(scheduler.decoders)), "host": "127.0.0.1", "port": 8200}
+            return method_fn(*args, **kwargs)
+
+        async def get_client(self, _role, _key):
+            return FakeClient()
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(
+        max_retries=0,
+        retry_delay=0,
+        enable_kv_cache_aware_routing=True,
+        enable_reusable_prefix_affinity_gate=True,
+        prefix_hash_chars=0,
+    ))
+    monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
+
+    s_key = "body:session_id:s1"
+    with caplog.at_level("WARNING", logger=proxy.logger.name):
+        instance_info = asyncio.run(
+            proxy.assign_instances(
+                "/completions",
+                {"session_id": "s1"},
+                100,
+                is_initial_request=True,
+                session_key=s_key,
+                prefix_key=None,
+            )
+        )
+    scheduler.release_prefill_kv(instance_info.prefiller_key, instance_info.prefiller_score)
+    scheduler.release_decoder(
+        next(iter(scheduler.decoders)),
+        instance_info.decoder_score,
+    )
+    assert s_key in scheduler.session_lru
+    assert any(
+        "reusable_prefix_tokens" in record.getMessage()
+        for record in caplog.records
+    )

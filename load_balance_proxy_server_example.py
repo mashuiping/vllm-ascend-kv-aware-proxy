@@ -1344,6 +1344,21 @@ async def assign_instances(
         )
         raise
 
+    reusable_prefix_tokens = extract_reusable_prefix_tokens(response_json)
+    allow_affinity = True
+    if getattr(args, "enable_reusable_prefix_affinity_gate", False):
+        if reusable_prefix_tokens is None:
+            logger.warning(
+                "Reusable-prefix affinity gate enabled but Prefill response is missing "
+                "complete prompt_tokens_details (reusable_prefix_tokens=None); falling back to "
+                "optimistic bind for request %s session=%s prefix=%s",
+                request_id,
+                session_key,
+                prefix_key,
+            )
+        else:
+            allow_affinity = reusable_prefix_tokens > 0
+
     try:
         await runtime.schedule(
             "complete_prefill",
@@ -1352,6 +1367,7 @@ async def assign_instances(
             session_key,
             prefix_key,
             prefiller["route_source"],
+            allow_affinity,
         )
     except Exception:
         await _abort_prefill_selection(
@@ -1388,13 +1404,18 @@ async def assign_instances(
         affinity_key = prefix_key
     else:
         affinity_key = None
+    extra_route_fields: dict[str, Any] = {}
+    if getattr(args, "enable_reusable_prefix_affinity_gate", False):
+        extra_route_fields["reusable_prefix_tokens"] = reusable_prefix_tokens
+        extra_route_fields["affinity_committed"] = allow_affinity
     logger.info(
-        "Routed request %s prefiller=%s decoder=%s source=%s affinity_key=%s",
+        "Routed request %s prefiller=%s decoder=%s source=%s affinity_key=%s%s",
         request_id,
         prefiller_client.base_url,
         decoder_client.base_url,
         route_source,
         affinity_key,
+        (" " + " ".join(f"{k}={v}" for k, v in extra_route_fields.items())) if extra_route_fields else "",
     )
     return InstanceInfo(
         request_id=request_id,
