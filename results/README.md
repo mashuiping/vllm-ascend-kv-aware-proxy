@@ -10,6 +10,7 @@ Every published experiment should contain:
 <experiment-id>/
 ├── README.md
 ├── metadata.json
+├── workload.jsonl.manifest.json
 ├── baseline-summary.json
 ├── candidate-off-summary.json
 ├── candidate-on-summary.json
@@ -24,8 +25,8 @@ Every published experiment should contain:
 - NPU type, node topology and model identifier;
 - Prefill/Decode configuration;
 - complete benchmark arguments and random seed;
+- workload profile, SHA-256 and whether model-token counts were verified;
 - run order, reset procedure and repetition count.
 
 Do not publish API keys, full production prompts, Kubernetes Secrets, internal
 hostnames, Pod IPs, model credentials, or unreviewed raw logs.
-

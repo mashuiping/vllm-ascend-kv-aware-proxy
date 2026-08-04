@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "session-affinity",
+  "scenario": "session-long",
+  "seed": 20260724,
+  "data": {
+    "sessions": 60,
+    "turns": 5,
+    "system_prompt_tokens": 2048,
+    "turn_input_tokens": 200,
+    "fixed_assistant_text": "Acknowledged."
+  },
+  "load": {
+    "type": "turn-barrier",
+    "concurrency": 20
+  },
+  "request": {
+    "max_tokens": 32,
+    "temperature": 0.0
+  }
+}

@@ -22,6 +22,8 @@ A versus C only as the end-to-end comparison with stock upstream.
 - Use identical prompts, seeds, session IDs and concurrency.
 - Alternate group order across repetitions instead of always running A/B/C.
 - Record warm-up separately from measured requests.
+- Generate one immutable workload and use its SHA-256 in every A/B/C group.
+- Define prompt sizes in model tokens and verify them with the served tokenizer.
 - Run enough repetitions to distinguish a stable effect from normal variance.
 
 At minimum, record the image digest, model identifier, NPU type, CANN and driver
@@ -40,8 +42,13 @@ benchmark command and reset outcome.
 
 Start with low concurrency to prove cache behavior, then use a concurrency
 ladder appropriate for the deployed capacity. Short output lengths emphasize
-Prefill and TTFT. The generated `prefix-words` value controls workload size;
-report actual server `prompt_tokens` from results.
+Prefill and TTFT. For legacy generated workloads, `prefix-words` is only an
+approximation; always report actual server `prompt_tokens` from results.
+
+The preferred runner uses the checked-in profiles under `benchmarks/profiles/`
+instead of the legacy `prefix-words` generator. See
+[`benchmarks/README.md`](../benchmarks/README.md) for exact-token generation,
+cache-fill phases, Poisson QPS stages and capacity sizing.
 
 ## Required metrics
 
@@ -70,6 +77,18 @@ The benchmark writes request JSONL, configuration, metric snapshots and a
 summary under the selected output directory. The helper maps each experiment
 group onto deployment variables:
 
+For a production comparison, generate one workload and run the complete matrix:
+
+```bash
+BASE_URL=http://127.0.0.1:8000 \
+TOKENIZER_URL=http://PREFILLER:7100 \
+MODEL=qwen3-32b PREFILL_NODE=<node> \
+  bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
+```
+
+The individual commands below remain useful for debugging and legacy generated
+workloads:
+
 ```bash
 BASE_URL=http://127.0.0.1:8000 MODEL=qwen3-32b \
   bash scripts/run_experiment.sh baseline
@@ -91,4 +110,3 @@ BASE_URL=http://127.0.0.1:8000 MODEL=qwen3-32b \
 
 Review and redact artifacts according to [`results/README.md`](../results/README.md)
 before publishing them.
-

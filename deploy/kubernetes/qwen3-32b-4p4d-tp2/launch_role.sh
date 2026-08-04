@@ -134,7 +134,6 @@ command=(
     --block-size 128
     --trust-remote-code
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-    --enforce-eager
     --kv-transfer-config "${kv_transfer_config}"
   )
 

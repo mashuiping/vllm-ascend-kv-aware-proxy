@@ -36,7 +36,7 @@ case "${GROUP}" in
 esac
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-output_dir="${RESULTS_DIR:-${REPO_ROOT}/results/runs}/${timestamp}-${GROUP}"
+output_dir="${OUTPUT_DIR:-${RESULTS_DIR:-${REPO_ROOT}/results/runs}/${timestamp}-${GROUP}}"
 benchmark_args=(
   --base-url "${BASE_URL}"
   --model "${MODEL}"
@@ -44,13 +44,18 @@ benchmark_args=(
   --sessions "${SESSIONS:-256}"
   --turns "${TURNS:-6}"
   --concurrency "${CONCURRENCY:-64}"
-  --prefix-words "${PREFIX_WORDS:-8192}"
+  --prefix-words "${PREFIX_WORDS:-1024}"
   --max-tokens "${MAX_TOKENS:-16}"
   --seed "${SEED:-20260724}"
   --label "${GROUP}"
   --output-dir "${output_dir}"
   --reset-before
+  --system-warmup-requests "${SYSTEM_WARMUP_REQUESTS:-8}"
 )
+
+if [[ -n "${WORKLOAD_FILE:-}" ]]; then
+  benchmark_args+=(--workload-file "${WORKLOAD_FILE}")
+fi
 
 if [[ -n "${COMPARE_WITH:-}" ]]; then
   benchmark_args+=(--compare-with "${COMPARE_WITH}")
@@ -62,4 +67,3 @@ bash "${DEPLOY_DIR}/deploy.sh" proxy
 "${PYTHON_BIN}" "${SCRIPT_DIR}/benchmark_session_affinity.py" "${benchmark_args[@]}" "$@"
 
 echo "experiment complete: ${output_dir}"
-

@@ -12,7 +12,7 @@ Example:
     --model glm5.1 \
     --scenario session-long \
     --sessions 256 --turns 6 --concurrency 64 \
-    --prefix-words 8192 --max-tokens 16 \
+    --prefix-words 1024 --max-tokens 16 \
     --prefill-metrics-url http://p0:7100/metrics \
     --prefill-metrics-url http://p1:7100/metrics \
     --prefill-metrics-url http://p2:7100/metrics \
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import math
 import os
@@ -33,7 +34,6 @@ import re
 import statistics
 import threading
 import time
-import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,11 @@ from urllib.parse import urljoin
 
 import requests
 from requests.adapters import HTTPAdapter
+
+try:
+    from benchmark_workload import PlannedRequest, load_workload_jsonl
+except ModuleNotFoundError:  # Imported as scripts.benchmark_session_affinity in tests.
+    from scripts.benchmark_workload import PlannedRequest, load_workload_jsonl
 
 PROMETHEUS_LINE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>.*)\})?\s+"
@@ -69,8 +74,12 @@ class RequestResult:
     session_id: str
     turn: int
     scenario: str
+    phase: str
+    stage: str
     status_code: int | None
     ok: bool
+    started_at_s: float
+    ended_at_s: float
     ttfb_ms: float | None
     ttft_ms: float | None
     e2e_ms: float
@@ -116,6 +125,22 @@ def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
     cached_tokens = [
         float(result.client_cached_tokens) for result in successful if result.client_cached_tokens is not None
     ]
+    cache_pairs = [
+        (float(result.client_cached_tokens), float(result.prompt_tokens))
+        for result in successful
+        if result.client_cached_tokens is not None and result.prompt_tokens is not None
+    ]
+    completion_tokens = [
+        float(result.completion_tokens) for result in successful if result.completion_tokens is not None
+    ]
+    computed_tokens = [
+        float(result.prompt_tokens - result.client_cached_tokens)
+        for result in successful
+        if result.prompt_tokens is not None and result.client_cached_tokens is not None
+    ]
+    started_at = [result.started_at_s for result in successful]
+    ended_at = [result.ended_at_s for result in successful]
+    window_seconds = max(ended_at) - min(started_at) if started_at and ended_at else 0.0
 
     def describe(values: list[float]) -> dict[str, float | int | None]:
         return {
@@ -138,6 +163,20 @@ def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
         "e2e_ms": describe(e2e),
         "prompt_tokens": describe(prompt_tokens),
         "client_cached_tokens": describe(cached_tokens),
+        "client_computed_tokens": describe(computed_tokens),
+        "completion_tokens": describe(completion_tokens),
+        "cached_token_request_rate": (
+            sum(value > 0 for value in cached_tokens) / len(cached_tokens) if cached_tokens else None
+        ),
+        "cached_token_ratio": (
+            sum(cached for cached, _ in cache_pairs) / sum(prompt for _, prompt in cache_pairs)
+            if cache_pairs and sum(prompt for _, prompt in cache_pairs) > 0
+            else None
+        ),
+        "measurement_window_seconds": window_seconds,
+        "request_throughput_per_second": (len(successful) / window_seconds if window_seconds > 0 else None),
+        "input_token_throughput_per_second": (sum(prompt_tokens) / window_seconds if window_seconds > 0 else None),
+        "output_token_throughput_per_second": (sum(completion_tokens) / window_seconds if window_seconds > 0 else None),
     }
 
 
@@ -267,6 +306,33 @@ class EndpointSampler:
                     }
                 )
         return snapshots
+
+    def snapshot_health(self, phase: str) -> float | None:
+        """Persist a health snapshot and return its timestamp for phase filtering."""
+        if not self.health_url:
+            return None
+        timestamp = time.time()
+        try:
+            self.writer.write(
+                {
+                    "timestamp": timestamp,
+                    "kind": "proxy_health",
+                    "phase": phase,
+                    "url": self.health_url,
+                    "value": self._get_health(),
+                }
+            )
+        except Exception as exc:
+            self.writer.write(
+                {
+                    "timestamp": timestamp,
+                    "kind": "health_error",
+                    "phase": phase,
+                    "url": self.health_url,
+                    "error": repr(exc),
+                }
+            )
+        return timestamp
 
     def _run(self) -> None:
         while not self.stop_event.wait(self.interval):
@@ -439,6 +505,8 @@ def send_request(
     session_index: int,
     turn: int,
     scenario: str,
+    phase: str,
+    stage: str,
     session_header: str,
     send_session_key: bool,
     max_tokens: int,
@@ -465,6 +533,7 @@ def send_request(
         "temperature": temperature,
     }
 
+    started_at_s = time.time()
     started = time.perf_counter()
     ttfb_ms: float | None = None
     ttft_ms: float | None = None
@@ -516,6 +585,7 @@ def send_request(
         error = repr(exc)
 
     ended = time.perf_counter()
+    ended_at_s = time.time()
     details = usage.get("prompt_tokens_details")
     details = details if isinstance(details, dict) else {}
     output = "".join(output_parts)
@@ -524,8 +594,12 @@ def send_request(
         session_id=session_id,
         turn=turn,
         scenario=scenario,
+        phase=phase,
+        stage=stage,
         status_code=status_code,
         ok=error is None and status_code is not None and status_code < 400,
+        started_at_s=started_at_s,
+        ended_at_s=ended_at_s,
         ttfb_ms=ttfb_ms,
         ttft_ms=ttft_ms,
         e2e_ms=(ended - started) * 1000,
@@ -555,7 +629,10 @@ def reset_cache(url: str, api_key: str | None, timeout: float, verify: bool) -> 
     response.raise_for_status()
 
 
-def summarize_health_samples(samples_path: Path) -> dict[str, Any]:
+def summarize_health_samples(
+    samples_path: Path,
+    start_timestamp: float | None = None,
+) -> dict[str, Any]:
     spreads: list[float] = []
     cvs: list[float] = []
     max_priorities: list[float] = []
@@ -580,6 +657,8 @@ def summarize_health_samples(samples_path: Path) -> dict[str, Any]:
         for line in stream:
             sample = json.loads(line)
             if sample.get("kind") != "proxy_health":
+                continue
+            if start_timestamp is not None and float(sample.get("timestamp", 0)) < start_timestamp:
                 continue
             health = sample.get("value") or {}
             for field in ("session_affinity_stats", "prefix_affinity_stats"):
@@ -681,8 +760,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sessions", type=int, default=256)
     parser.add_argument("--turns", type=int, default=6)
     parser.add_argument("--concurrency", type=int, default=64)
-    parser.add_argument("--prefix-words", type=int, default=8192)
+    parser.add_argument("--prefix-words", type=int, default=1024)
     parser.add_argument("--prefix-file", help="Use a real stable prefix instead of generated words.")
+    parser.add_argument(
+        "--workload-file",
+        type=Path,
+        help="Immutable JSONL workload generated once and shared by all A/B/C groups.",
+    )
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--think-time", type=float, default=0.0)
@@ -709,6 +793,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-url", help="Proxy reset endpoint; derived by default.")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
     parser.add_argument("--seed", type=int, default=20260724)
+    parser.add_argument(
+        "--system-warmup-requests",
+        type=int,
+        default=0,
+        help="Sacrificial requests sent before cache reset and metric snapshots.",
+    )
     parser.add_argument("--label", default="session-affinity")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -718,6 +808,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.sessions <= 0 or args.turns <= 0 or args.concurrency <= 0:
         parser.error("sessions, turns, and concurrency must be positive")
+    if args.system_warmup_requests < 0:
+        parser.error("system-warmup-requests must be non-negative")
     if args.scenario == "one-shot":
         args.turns = 1
     return args
@@ -738,16 +830,21 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
         "warm_turns.ttft_ms.p95",
         "warm_turns.ttft_ms.p99",
         "warm_turns.e2e_ms.p95",
+        "warm_turns.cached_token_request_rate",
+        "warm_turns.cached_token_ratio",
+        "warm_turns.client_computed_tokens.mean",
+        "warm_turns.request_throughput_per_second",
+        "warm_turns.output_token_throughput_per_second",
         "overall.success_rate",
-        "metrics_delta_by_role.prefill.derived:prefix_cache_hit_rate",
-        "metrics_delta_by_role.prefill.derived:mean_prefill_computed_tokens",
-        "metrics_delta_by_role.prefill.derived:mean:vllm:request_prefill_time_seconds",
-        "metrics_delta_by_role.prefill.derived:mean:vllm:request_queue_time_seconds",
-        "metrics_delta_by_role.decode.derived:mean:vllm:request_queue_time_seconds",
-        "proxy_prefill_load_balance.priority_cv_p95",
-        ("proxy_prefill_load_balance.session_affinity_stats_delta." "derived_overload_fallback_rate"),
-        ("proxy_prefill_load_balance.prefix_affinity_stats_delta." "derived_prefix_hit_rate"),
-        ("proxy_prefill_load_balance.prefix_affinity_stats_delta." "derived_spillover_rate"),
+        "measurement_metrics_delta_by_role.prefill.derived:prefix_cache_hit_rate",
+        "measurement_metrics_delta_by_role.prefill.derived:mean_prefill_computed_tokens",
+        "measurement_metrics_delta_by_role.prefill.derived:mean:vllm:request_prefill_time_seconds",
+        "measurement_metrics_delta_by_role.prefill.derived:mean:vllm:request_queue_time_seconds",
+        "measurement_metrics_delta_by_role.decode.derived:mean:vllm:request_queue_time_seconds",
+        "proxy_prefill_load_balance_measurement.priority_cv_p95",
+        ("proxy_prefill_load_balance_measurement.session_affinity_stats_delta." "derived_overload_fallback_rate"),
+        ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_prefix_hit_rate"),
+        ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_spillover_rate"),
     )
     comparison: dict[str, Any] = {}
     lower_is_better = (
@@ -784,14 +881,28 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
     return comparison
 
 
+def workload_stages(records: list[PlannedRequest]) -> list[list[PlannedRequest]]:
+    """Return contiguous phase/stage batches without silently merging repeats."""
+    batches: list[list[PlannedRequest]] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        key = (record.phase, record.stage)
+        if not batches or (batches[-1][0].phase, batches[-1][0].stage) != key:
+            if key in seen:
+                raise ValueError(f"workload phase/stage is not contiguous: {key}")
+            batches.append([])
+            seen.add(key)
+        batches[-1].append(record)
+    return batches
+
+
 def main() -> int:
     args = parse_args()
     random.seed(args.seed)
+    planned_records = load_workload_jsonl(args.workload_file) if args.workload_file else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    requests_writer = JsonlWriter(output_dir / "requests.jsonl")
     samples_path = output_dir / "samples.jsonl"
-    samples_writer = JsonlWriter(samples_path)
     api_url, derived_health_url = derive_urls(args.base_url)
     health_url = None if args.no_health_sampling else (args.health_url or derived_health_url)
     root_url = args.base_url.rstrip("/")
@@ -801,20 +912,67 @@ def main() -> int:
     api_key = os.environ.get(args.api_key_env)
     verify = not args.insecure
 
-    config = vars(args).copy()
+    config = {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()}
     config["api_url"] = api_url
     config["health_url"] = health_url
     config["reset_url"] = reset_url
     config["api_key_present"] = bool(api_key)
+    if args.workload_file:
+        config["workload_sha256"] = hashlib.sha256(args.workload_file.read_bytes()).hexdigest()
+        config["workload_requests"] = len(planned_records or [])
+        config["workload_scenarios"] = sorted({record.scenario for record in planned_records or []})
+        config["workload_stages"] = list(dict.fromkeys(record.stage for record in planned_records or []))
+        config["workload_max_tokens"] = sorted({record.max_tokens for record in planned_records or []})
     config.pop("api_key_env", None)
     (output_dir / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
 
+    if args.system_warmup_requests:
+        warmup_writer = JsonlWriter(output_dir / "system-warmup.jsonl")
+        warmup_http = make_http_session(1)
+        try:
+            for index in range(args.system_warmup_requests):
+                result, _ = send_request(
+                    http=warmup_http,
+                    api_url=api_url,
+                    api_key=api_key,
+                    model=args.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"System warm-up request {args.seed}-{index}; reply briefly.",
+                        }
+                    ],
+                    session_id=f"system-warmup-{args.seed}-{index}",
+                    session_index=-1,
+                    turn=-1,
+                    scenario="system-warmup",
+                    phase="system-warmup",
+                    stage="system-warmup",
+                    session_header=args.session_header,
+                    send_session_key=False,
+                    max_tokens=1,
+                    temperature=0.0,
+                    timeout=args.timeout,
+                    verify=verify,
+                )
+                warmup_writer.write(asdict(result))
+                if not result.ok:
+                    raise RuntimeError(f"system warm-up failed: {result.error}")
+        finally:
+            warmup_http.close()
+            warmup_writer.close()
+
+    # Infrastructure warm-up deliberately happens before this reset. The
+    # measured cache-fill phase therefore starts with empty backend KV and,
+    # for the candidate, empty routing-affinity LRUs.
     if args.reset_before:
         reset_cache(reset_url, api_key, args.timeout, verify)
 
+    requests_writer = JsonlWriter(output_dir / "requests.jsonl")
+    samples_writer = JsonlWriter(samples_path)
     all_metrics_urls = list(dict.fromkeys(args.prefill_metrics_url + args.decode_metrics_url + args.metrics_url))
     sampler = EndpointSampler(
         health_url=health_url,
@@ -826,14 +984,20 @@ def main() -> int:
     )
     sampler.start(output_dir)
 
-    common_prefix = read_prefix(args)
-    histories = [build_initial_messages(args.scenario, index, common_prefix) for index in range(args.sessions)]
-    session_ids = [f"bench-{args.seed}-{index}-{uuid.uuid4().hex[:8]}" for index in range(args.sessions)]
-    if args.scenario == "hot-key":
+    common_prefix = read_prefix(args) if planned_records is None else ""
+    histories = (
+        [build_initial_messages(args.scenario, index, common_prefix) for index in range(args.sessions)]
+        if planned_records is None
+        else []
+    )
+    session_ids = [f"bench-{args.seed}-{index:08d}" for index in range(args.sessions)]
+    if args.scenario == "hot-key" and planned_records is None:
         session_ids = [f"bench-hot-key-{args.seed}"] * args.sessions
 
     all_results: list[RequestResult] = []
     thread_local = threading.local()
+    measurement_metrics_before: dict[str, dict[str, float]] | None = None
+    measurement_health_started_at: float | None = None
 
     def warm_hot_prefix() -> None:
         warmup_http = make_http_session(1)
@@ -848,6 +1012,8 @@ def main() -> int:
                 session_index=-1,
                 turn=-1,
                 scenario="hot-prefix",
+                phase="cache-fill",
+                stage="hot-prefix-prime",
                 session_header=args.session_header,
                 send_session_key=not args.no_session_key,
                 max_tokens=args.max_tokens,
@@ -876,6 +1042,8 @@ def main() -> int:
             session_index=session_index,
             turn=turn,
             scenario=args.scenario,
+            phase="cache-fill" if turn == 0 else "measure",
+            stage=f"turn-{turn}",
             session_header=args.session_header,
             send_session_key=not args.no_session_key,
             max_tokens=args.max_tokens,
@@ -885,43 +1053,115 @@ def main() -> int:
         )
         return session_index, result, output
 
+    def invoke_planned(record: PlannedRequest) -> tuple[int, RequestResult, str]:
+        if not hasattr(thread_local, "http"):
+            thread_local.http = make_http_session(args.concurrency)
+        result, output = send_request(
+            http=thread_local.http,
+            api_url=api_url,
+            api_key=api_key,
+            model=args.model,
+            messages=record.messages,
+            session_id=record.session_id,
+            session_index=record.session_index,
+            turn=record.turn,
+            scenario=record.scenario,
+            phase=record.phase,
+            stage=record.stage,
+            session_header=args.session_header,
+            send_session_key=record.send_session_key,
+            max_tokens=record.max_tokens,
+            temperature=record.temperature,
+            timeout=args.timeout,
+            verify=verify,
+        )
+        return record.session_index, result, output
+
+    def record_completed(future: concurrent.futures.Future[tuple[int, RequestResult, str]]) -> None:
+        _, result, _ = future.result()
+        all_results.append(result)
+        requests_writer.write(asdict(result))
+
+    def print_stage(stage: str, phase: str) -> None:
+        current = latency_summary([result for result in all_results if result.stage == stage])
+        print(
+            json.dumps(
+                {
+                    "phase": phase,
+                    "stage": stage,
+                    "requests": current["requests"],
+                    "success_rate": current["success_rate"],
+                    "ttft_p50_ms": current["ttft_ms"]["p50"],
+                    "ttft_p95_ms": current["ttft_ms"]["p95"],
+                    "e2e_p95_ms": current["e2e_ms"]["p95"],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
     started = time.time()
     try:
-        if args.scenario == "hot-prefix":
+        if args.scenario == "hot-prefix" and planned_records is None:
             warm_hot_prefix()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            for turn in range(args.turns):
-                futures = [executor.submit(invoke, index, turn) for index in range(args.sessions)]
-                for future in concurrent.futures.as_completed(futures):
-                    session_index, result, output = future.result()
-                    all_results.append(result)
-                    requests_writer.write(asdict(result))
-                    if result.ok:
-                        histories[session_index].append({"role": "assistant", "content": output or "Acknowledged."})
-                        histories[session_index].append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"Turn {turn + 2}: refine the previous answer, " "keeping it to one short sentence."
-                                ),
-                            }
+            if planned_records is not None:
+                batches = workload_stages(planned_records)
+                for batch_index, batch in enumerate(batches):
+                    offsets = [record.scheduled_offset_s for record in batch]
+                    if offsets != sorted(offsets):
+                        raise ValueError(f"scheduled offsets are not sorted in stage {batch[0].stage}")
+                    stage_started = time.perf_counter()
+                    pending: set[concurrent.futures.Future[tuple[int, RequestResult, str]]] = set()
+                    for record in batch:
+                        delay = stage_started + record.scheduled_offset_s - time.perf_counter()
+                        if delay > 0:
+                            time.sleep(delay)
+                        while len(pending) >= args.concurrency:
+                            done, pending = concurrent.futures.wait(
+                                pending,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                            for future in done:
+                                record_completed(future)
+                        pending.add(executor.submit(invoke_planned, record))
+                    for future in concurrent.futures.as_completed(pending):
+                        record_completed(future)
+                    print_stage(batch[0].stage, batch[0].phase)
+                    next_phase = batches[batch_index + 1][0].phase if batch_index + 1 < len(batches) else None
+                    if batch[0].phase == "cache-fill" and next_phase != "cache-fill":
+                        measurement_metrics_before = sampler.snapshot_metrics(
+                            output_dir,
+                            "after-cache-fill",
                         )
-                current = latency_summary([result for result in all_results if result.turn == turn])
-                print(
-                    json.dumps(
-                        {
-                            "turn": turn,
-                            "success_rate": current["success_rate"],
-                            "ttft_p50_ms": current["ttft_ms"]["p50"],
-                            "ttft_p95_ms": current["ttft_ms"]["p95"],
-                            "e2e_p95_ms": current["e2e_ms"]["p95"],
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                if args.think_time > 0 and turn + 1 < args.turns:
-                    time.sleep(args.think_time)
+                        measurement_health_started_at = sampler.snapshot_health("measure-start")
+            else:
+                for turn in range(args.turns):
+                    futures = [executor.submit(invoke, index, turn) for index in range(args.sessions)]
+                    for future in concurrent.futures.as_completed(futures):
+                        session_index, result, output = future.result()
+                        all_results.append(result)
+                        requests_writer.write(asdict(result))
+                        if result.ok:
+                            histories[session_index].append({"role": "assistant", "content": output or "Acknowledged."})
+                            histories[session_index].append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"Turn {turn + 2}: refine the previous answer, "
+                                        "keeping it to one short sentence."
+                                    ),
+                                }
+                            )
+                    print_stage(f"turn-{turn}", "cache-fill" if turn == 0 else "measure")
+                    if turn == 0:
+                        measurement_metrics_before = sampler.snapshot_metrics(
+                            output_dir,
+                            "after-cache-fill",
+                        )
+                        measurement_health_started_at = sampler.snapshot_health("measure-start")
+                    if args.think_time > 0 and turn + 1 < args.turns:
+                        time.sleep(args.think_time)
     finally:
         sampler.stop(output_dir)
         requests_writer.close()
@@ -932,6 +1172,7 @@ def main() -> int:
         for url in sorted(set(sampler.before) | set(sampler.after))
     }
     metric_deltas_by_role = {}
+    measurement_metric_deltas_by_role = {}
     for role, urls in (
         ("prefill", args.prefill_metrics_url),
         ("decode", args.decode_metrics_url),
@@ -942,19 +1183,36 @@ def main() -> int:
                 aggregate_metric_snapshots(urls, sampler.before),
                 aggregate_metric_snapshots(urls, sampler.after),
             )
+            if measurement_metrics_before is not None:
+                measurement_metric_deltas_by_role[role] = counter_delta(
+                    aggregate_metric_snapshots(urls, measurement_metrics_before),
+                    aggregate_metric_snapshots(urls, sampler.after),
+                )
+    scenario = planned_records[0].scenario if planned_records else args.scenario
+    turns = sorted({result.turn for result in all_results if result.turn >= 0})
+    stages = list(dict.fromkeys(result.stage for result in all_results))
     summary = {
         "label": args.label,
-        "scenario": args.scenario,
+        "scenario": scenario,
         "wall_time_seconds": time.time() - started,
         "overall": latency_summary(all_results),
-        "cold_turn": latency_summary([result for result in all_results if result.turn == 0]),
-        "warm_turns": latency_summary([result for result in all_results if result.turn > 0]),
+        "cache_fill": latency_summary([result for result in all_results if result.phase == "cache-fill"]),
+        "measured": latency_summary([result for result in all_results if result.phase == "measure"]),
+        "cold_turn": latency_summary([result for result in all_results if result.phase == "cache-fill"]),
+        "warm_turns": latency_summary([result for result in all_results if result.phase == "measure"]),
         "per_turn": {
-            str(turn): latency_summary([result for result in all_results if result.turn == turn])
-            for turn in range(args.turns)
+            str(turn): latency_summary([result for result in all_results if result.turn == turn]) for turn in turns
+        },
+        "per_stage": {
+            stage: latency_summary([result for result in all_results if result.stage == stage]) for stage in stages
         },
         "proxy_prefill_load_balance": summarize_health_samples(samples_path),
+        "proxy_prefill_load_balance_measurement": summarize_health_samples(
+            samples_path,
+            measurement_health_started_at,
+        ),
         "metrics_delta_by_role": metric_deltas_by_role,
+        "measurement_metrics_delta_by_role": measurement_metric_deltas_by_role,
         "metrics_delta_by_url": metric_deltas,
     }
     (output_dir / "summary.json").write_text(

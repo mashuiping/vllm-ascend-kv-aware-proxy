@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "offline-smoke",
+  "scenario": "session-long",
+  "seed": 7,
+  "data": {
+    "sessions": 2,
+    "turns": 2,
+    "system_prompt_tokens": 16,
+    "turn_input_tokens": 8,
+    "fixed_assistant_text": "Acknowledged."
+  },
+  "load": {
+    "type": "turn-barrier",
+    "concurrency": 2
+  },
+  "request": {
+    "max_tokens": 4,
+    "temperature": 0.0
+  }
+}

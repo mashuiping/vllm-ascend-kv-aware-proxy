@@ -160,26 +160,41 @@ Use the same P/D Pods and change only the proxy group:
 | B: `candidate-off` | `candidate` | `false` | Candidate and restored load accounting without affinity |
 | C: `candidate-on` | `candidate` | `true` | KV-aware session/prefix affinity |
 
-The helper restarts only the proxy and resets backend prefix caches before the
-run. Keep a port-forward to the proxy open, then run:
+The recommended harness generates one immutable, exact-token workload and uses
+it for all three groups. It performs system warm-up, resets backend prefix
+caches, records cache-fill separately and then measures warm turns or QPS
+stages. See [benchmarks/README.md](benchmarks/README.md) for workload details.
+
+Keep a port-forward to the proxy open:
 
 ```bash
 kubectl -n qwen-pd port-forward service/pd-proxy 8000:8000
 ```
 
-In another shell:
+In another shell, provide one direct Prefiller URL for the vLLM tokenizer API:
 
 ```bash
 export PREFILL_NODE='your-prefill-node'
 export BASE_URL='http://127.0.0.1:8000'
+export TOKENIZER_URL='http://PREFILLER:7100'
 export MODEL='qwen3-32b'
 
-bash scripts/run_experiment.sh baseline
-bash scripts/run_experiment.sh candidate-off
-bash scripts/run_experiment.sh candidate-on
+bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
-Pass additional benchmark arguments after the group name. For example:
+For shared-prefix capacity and QPS-ladder testing, use
+`benchmarks/profiles/shared-prefix-capacity.json`.
+
+`run_experiment.sh` can still run one group. Set `WORKLOAD_FILE` to ensure it
+uses the same frozen data as the other groups:
+
+```bash
+WORKLOAD_FILE=results/runs/<experiment>/workload.jsonl \
+  bash scripts/run_experiment.sh candidate-on
+```
+
+Legacy on-the-fly generation remains available for debugging. Pass additional
+benchmark arguments after the group name, for example:
 
 ```bash
 bash scripts/run_experiment.sh candidate-on \
