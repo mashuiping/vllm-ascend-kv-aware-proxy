@@ -105,6 +105,9 @@ python load_balance_proxy_server_example.py \
   --prefix-lru-size 1024
 ```
 
+- `--enable-reusable-prefix-affinity-gate` (optional): skip affinity commit when
+  the Prefill response shows no reusable prefix. See `docs/design.md`.
+
 Example request:
 
 ```bash

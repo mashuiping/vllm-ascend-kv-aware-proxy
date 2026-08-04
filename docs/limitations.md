@@ -13,6 +13,16 @@ LRU state is not persisted. Proxy restart, manual prefix-cache reset, Prefiller
 removal and eviction discard bindings. This affects performance, not request
 correctness: a miss returns to load-based routing and recomputes KV.
 
+## Reusable-prefix gate depends on Prefiller details
+
+`--enable-reusable-prefix-affinity-gate` only takes effect when Prefillers
+report both `cached_tokens` and `created_cache_tokens` in `prompt_tokens_details`.
+The upstream `/v1/completions` path currently exposes `cached_tokens` only and
+falls back to the optimistic-bind branch with a warning. Older Prefiller builds
+that omit `prompt_tokens_details` when `cached_tokens == 0` also fall back to a
+bind. Gate behavior is an opt-in; without the flag, today's bind-everything
+behavior is preserved.
+
 ## Prefix hashing is conservative
 
 Only plain text requests are hashed. Multimodal inputs, structured content and

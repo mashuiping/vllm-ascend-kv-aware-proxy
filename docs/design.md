@@ -89,3 +89,29 @@ Consequently, candidate-off is not byte-for-byte equivalent to the exact
 upstream baseline; this is why experiments include three groups rather than
 only an on/off comparison.
 
+## Reusable-prefix affinity gate
+
+With `--enable-reusable-prefix-affinity-gate`, the proxy decides whether to
+commit session/prefix affinity from the Prefill response:
+
+```text
+reusable_prefix_tokens =
+    prompt_tokens_details.cached_tokens
+  + prompt_tokens_details.created_cache_tokens
+```
+
+Action of the gate:
+
+| Condition | Action |
+| --- | --- |
+| Gate off | Bind session/prefix as today |
+| Gate on, details complete, `reusable > 0` | Bind |
+| Gate on, details complete, `reusable == 0` | Do not bind |
+| Gate on, details missing or incomplete | Warning log + bind (optimistic default) |
+
+`reusable == 0` does not clear an existing binding; sticky routing is
+preserved so the Prefiller can rebuild cache after an LRU miss. Session and
+prefix affinity share the same latch. The gate is a no-op without
+`--enable-kv-cache-aware-routing`. Prefillers should run with
+`--enable-prompt-tokens-details` (and prefix caching).
+
