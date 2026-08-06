@@ -72,28 +72,40 @@ Run at approximately 25%, 50%, 75% and 110% to cover ample capacity, normal
 pressure, cache stress and eviction. Record the observed vLLM KV capacity and
 usage; do not infer it only from model configuration.
 
-## Running A/B/C
+## Running A/B/C in Kubernetes
 
-The orchestrator generates the workload once, then passes the same file to all
-groups:
+The orchestrator creates one temporary benchmark Pod in `NAMESPACE` (default
+`qwen-pd`). The Pod calls `pd-prefill-0.pd-prefill:7100` for exact tokenization
+and `pd-proxy:8000` for load, avoiding local port-forward connections. The local
+script only changes the proxy group and copies final artifacts back:
 
 ```bash
 export PREFILL_NODE='your-prefill-node'
-export BASE_URL='http://127.0.0.1:8000'
-export TOKENIZER_URL='http://PREFILLER:7100'
+export VLLM_IMAGE='your-tested-vllm-ascend-image'
 export MODEL='qwen3-32b'
 
 bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
+Override the in-cluster endpoints only when the Services use different names:
+
+```bash
+export IN_CLUSTER_TOKENIZER_URL='http://custom-prefill:7100'
+export IN_CLUSTER_BASE_URL='http://custom-proxy:8000'
+```
+
+On success, the temporary Pod and ConfigMap are removed after results are
+copied to `results/runs/`. On failure they are retained and the script prints an
+inspection command. Set `KEEP_BENCHMARK_POD=true` to retain them after success.
+
 Common runner arguments are forwarded to every group. For example, add all
-Prefiller and Decoder metrics endpoints without changing the workload:
+Prefiller and Decoder metrics endpoints using their in-cluster DNS names:
 
 ```bash
 bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json \
-  --prefill-metrics-url http://P0:7100/metrics \
-  --prefill-metrics-url http://P1:7100/metrics \
-  --decode-metrics-url http://D0:7100/metrics
+  --prefill-metrics-url http://pd-prefill-0.pd-prefill:7100/metrics \
+  --prefill-metrics-url http://pd-prefill-1.pd-prefill:7100/metrics \
+  --decode-metrics-url http://pd-decode-0.pd-decode:7200/metrics
 ```
 
 The experiment directory contains the shared workload and manifest, one fixed
@@ -110,6 +122,17 @@ GROUP_ORDER='candidate-off candidate-on baseline' \
 At least six repetitions should cover the six A/B/C permutations. Treat
 `candidate-off` versus `candidate-on` as the affinity comparison; the upstream
 baseline versus candidate-off comparison measures other candidate changes.
+
+For compatibility, the previous local/port-forward execution path remains
+available:
+
+```bash
+BENCHMARK_EXECUTION_MODE=local \
+BASE_URL=http://127.0.0.1:8000 \
+TOKENIZER_URL=http://127.0.0.1:7100 \
+MODEL=qwen3-32b PREFILL_NODE=<node> \
+  bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
+```
 
 The workload design follows the public multi-turn shape described by Higress
 and the shared-prefix, cache-capacity and staged-load methodology published by

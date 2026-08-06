@@ -16,6 +16,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_DIR="${REPO_ROOT}/deploy/kubernetes/qwen3-32b-4p4d-tp2"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
+log() {
+  printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
+}
+
 case "${GROUP}" in
   baseline)
     export PROXY_VARIANT=baseline
@@ -63,7 +67,10 @@ fi
 
 # Only the proxy is restarted. Keeping the P/D topology fixed reduces the
 # number of variables between groups; --reset-before clears prefix caches.
+log "${GROUP}: deploying proxy variant=${PROXY_VARIANT} kv_aware=${KV_AWARE_ROUTING}"
 bash "${DEPLOY_DIR}/deploy.sh" proxy
+log "${GROUP}: proxy ready; starting benchmark output=${output_dir}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/benchmark_session_affinity.py" "${benchmark_args[@]}" "$@"
 
+log "${GROUP}: benchmark complete"
 echo "experiment complete: ${output_dir}"

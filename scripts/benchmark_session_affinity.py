@@ -32,6 +32,7 @@ import os
 import random
 import re
 import statistics
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -929,7 +930,17 @@ def main() -> int:
         encoding="utf-8",
     )
 
+    print(
+        f"[benchmark] label={args.label} requests={len(planned_records or []) or 'generated'} " f"output={output_dir}",
+        file=sys.stderr,
+        flush=True,
+    )
     if args.system_warmup_requests:
+        print(
+            f"[benchmark] system warmup: {args.system_warmup_requests} requests",
+            file=sys.stderr,
+            flush=True,
+        )
         warmup_writer = JsonlWriter(output_dir / "system-warmup.jsonl")
         warmup_http = make_http_session(1)
         try:
@@ -969,6 +980,7 @@ def main() -> int:
     # measured cache-fill phase therefore starts with empty backend KV and,
     # for the candidate, empty routing-affinity LRUs.
     if args.reset_before:
+        print("[benchmark] resetting backend prefix/affinity caches", file=sys.stderr, flush=True)
         reset_cache(reset_url, api_key, args.timeout, verify)
 
     requests_writer = JsonlWriter(output_dir / "requests.jsonl")
@@ -983,6 +995,7 @@ def main() -> int:
         writer=samples_writer,
     )
     sampler.start(output_dir)
+    print("[benchmark] metrics sampling started; running workload", file=sys.stderr, flush=True)
 
     common_prefix = read_prefix(args) if planned_records is None else ""
     histories = (

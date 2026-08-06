@@ -7,6 +7,8 @@ import argparse
 import hashlib
 import json
 import os
+import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -46,10 +48,18 @@ class ServerTokenizer:
         self.timeout = timeout
         self.verify = verify
         self.http = requests.Session()
+        self.tokenize_calls = 0
         if api_key:
             self.http.headers["Authorization"] = f"Bearer {api_key}"
 
     def tokenize(self, prompt: str) -> list[int]:
+        self.tokenize_calls += 1
+        if self.tokenize_calls == 1 or self.tokenize_calls % 25 == 0:
+            print(
+                f"[workload] tokenizer calls={self.tokenize_calls}",
+                file=sys.stderr,
+                flush=True,
+            )
         response = self.http.post(
             self.tokenize_url,
             json={"model": self.model, "prompt": prompt, "add_special_tokens": False},
@@ -112,6 +122,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     profile = load_profile(args.profile)
+    started = time.monotonic()
+    print(
+        f"[workload] loading profile={args.profile} tokenizer={args.tokenizer_url or 'unverified-smoke'}",
+        file=sys.stderr,
+        flush=True,
+    )
     tokenizer: ServerTokenizer | None = None
     try:
         if args.tokenizer_url:
@@ -126,6 +142,11 @@ def main() -> int:
         else:
             factory = TokenTextFactory()
         records = generate_workload(profile, factory)
+        print(
+            f"[workload] generated {len(records)} requests in {time.monotonic() - started:.1f}s; writing JSONL",
+            file=sys.stderr,
+            flush=True,
+        )
         write_workload_jsonl(args.output, records)
         manifest = workload_manifest(profile, records, factory.verified)
         manifest["sha256"] = hashlib.sha256(args.output.read_bytes()).hexdigest()

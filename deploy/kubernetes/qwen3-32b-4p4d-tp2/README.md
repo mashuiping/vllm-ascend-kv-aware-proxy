@@ -128,6 +128,10 @@ bash deploy.sh status
 kubectl -n "${NAMESPACE:-qwen-pd}" port-forward service/pd-proxy 8000:8000
 ```
 
+The reproducible A/B/C harness does not require this port-forward. It creates a
+temporary CPU-only Pod from `benchmark-pod.yaml`, uses in-cluster Service DNS
+for tokenizer and benchmark traffic, and copies results back when complete.
+
 ## Cleanup
 
 ```bash

@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __BENCHMARK_POD__
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: pd-benchmark
+spec:
+  restartPolicy: Never
+  containers:
+    - name: benchmark
+      image: "__VLLM_IMAGE__"
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/bash
+        - -ec
+        - "trap : TERM INT; sleep infinity & wait"
+      env:
+        - name: PYTHONPATH
+          value: /opt/benchmark
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+      volumeMounts:
+        - name: assets
+          mountPath: /opt/benchmark
+          readOnly: true
+        - name: results
+          mountPath: /results
+  volumes:
+    - name: assets
+      configMap:
+        name: __BENCHMARK_CONFIGMAP__
+    - name: results
+      emptyDir: {}

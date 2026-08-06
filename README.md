@@ -160,27 +160,25 @@ Use the same P/D Pods and change only the proxy group:
 | B: `candidate-off` | `candidate` | `false` | Candidate and restored load accounting without affinity |
 | C: `candidate-on` | `candidate` | `true` | KV-aware session/prefix affinity |
 
-The recommended harness generates one immutable, exact-token workload and uses
-it for all three groups. It performs system warm-up, resets backend prefix
+The recommended harness creates a temporary benchmark Pod in the model
+namespace. The Pod talks directly to the Prefiller tokenizer and proxy Services,
+so no port-forward is required. It generates one immutable, exact-token
+workload for all three groups, performs system warm-up, resets backend prefix
 caches, records cache-fill separately and then measures warm turns or QPS
 stages. See [benchmarks/README.md](benchmarks/README.md) for workload details.
 
-Keep a port-forward to the proxy open:
-
-```bash
-kubectl -n qwen-pd port-forward service/pd-proxy 8000:8000
-```
-
-In another shell, provide one direct Prefiller URL for the vLLM tokenizer API:
-
 ```bash
 export PREFILL_NODE='your-prefill-node'
-export BASE_URL='http://127.0.0.1:8000'
-export TOKENIZER_URL='http://PREFILLER:7100'
+export VLLM_IMAGE='your-tested-vllm-ascend-image'
 export MODEL='qwen3-32b'
 
 bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
+
+The completed workload, manifest, group results and comparison are copied from
+the Pod to `results/runs/`. Set `KEEP_BENCHMARK_POD=true` to retain the Pod for
+debugging. The old port-forward workflow remains available with
+`BENCHMARK_EXECUTION_MODE=local` plus `BASE_URL` and `TOKENIZER_URL`.
 
 For shared-prefix capacity and QPS-ladder testing, use
 `benchmarks/profiles/shared-prefix-capacity.json`.
