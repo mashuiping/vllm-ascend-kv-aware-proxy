@@ -60,6 +60,8 @@ export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-10}"
 export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+# Enable /reset_prefix_cache so benchmark runners can clear backend KV between A/B/C groups.
+export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
 export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
 export CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1}"
 export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT="${VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:-480}"

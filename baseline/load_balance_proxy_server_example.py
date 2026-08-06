@@ -1196,14 +1196,13 @@ async def reset_prefix_cache(request: Request):
     runtime = get_runtime()
     await runtime.sync_clients()
     snapshot = runtime.scheduler.get_snapshot()
-    backend_instances = [(ServerRole.PREFILL, server) for server in snapshot["prefill_instances"]] + [
-        (ServerRole.DECODE, server) for server in snapshot["decode_instances"]
-    ]
+    # Prefillers own the prefix KV in this PD topology; Decoders run with
+    # --no-enable-prefix-caching, so fan-out to decode is unnecessary.
     failures: list[str] = []
-    for role, server in backend_instances:
+    for server in snapshot["prefill_instances"]:
         base_url = build_server_url(server["host"], server["port"])
         try:
-            client = await runtime.get_client(role, server_key(server["host"], server["port"]))
+            client = await runtime.get_client(ServerRole.PREFILL, server_key(server["host"], server["port"]))
             resp = await client.post(f"{base_url}/reset_prefix_cache", params=params)
             resp.raise_for_status()
         except Exception as e:
