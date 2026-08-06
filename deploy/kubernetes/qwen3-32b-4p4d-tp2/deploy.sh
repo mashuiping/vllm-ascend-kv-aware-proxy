@@ -52,6 +52,7 @@ Usage:
   deploy.sh cleanup-prefill
   deploy.sh cleanup-decode
   deploy.sh cleanup-proxy
+  deploy.sh cleanup-benchmark
   deploy.sh cleanup-all
 
 Required:
@@ -277,11 +278,37 @@ cleanup_proxy() {
     --timeout=5m
 }
 
+cleanup_benchmark() {
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    echo "namespace ${NAMESPACE} does not exist; nothing to clean"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" delete pod,configmap \
+    -l app.kubernetes.io/name=pd-benchmark \
+    --ignore-not-found=true \
+    --wait=true \
+    --timeout=5m
+  # Older runs created unlabeled configmaps named pd-benchmark-*.
+  local leftover_cms
+  leftover_cms="$(
+    kubectl -n "${NAMESPACE}" get configmap -o name 2>/dev/null \
+      | grep '^configmap/pd-benchmark-' || true
+  )"
+  if [[ -n "${leftover_cms}" ]]; then
+    # shellcheck disable=SC2086
+    kubectl -n "${NAMESPACE}" delete ${leftover_cms} \
+      --ignore-not-found=true \
+      --wait=true \
+      --timeout=5m
+  fi
+}
+
 cleanup_all() {
   if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
     echo "namespace ${NAMESPACE} does not exist; nothing to clean"
     return 0
   fi
+  cleanup_benchmark
   kubectl -n "${NAMESPACE}" delete \
     statefulset/pd-prefill \
     statefulset/pd-decode \
@@ -349,6 +376,9 @@ case "${ACTION}" in
     ;;
   cleanup-proxy)
     cleanup_proxy
+    ;;
+  cleanup-benchmark)
+    cleanup_benchmark
     ;;
   cleanup-all)
     cleanup_all

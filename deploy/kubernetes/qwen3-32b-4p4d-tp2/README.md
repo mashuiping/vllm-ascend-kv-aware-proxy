@@ -138,7 +138,9 @@ for tokenizer and benchmark traffic, and copies results back when complete.
 bash deploy.sh cleanup-proxy
 bash deploy.sh cleanup-prefill
 bash deploy.sh cleanup-decode
-# Or remove all resources created by this deployment:
+bash deploy.sh cleanup-benchmark
+# Or remove all resources created by this deployment (including leftover
+# pd-benchmark Pods/ConfigMaps):
 bash deploy.sh cleanup-all
 ```
 

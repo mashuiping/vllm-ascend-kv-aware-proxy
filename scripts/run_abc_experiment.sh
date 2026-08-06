@@ -146,6 +146,8 @@ run_in_pod() {
     --from-file=compare_abc_results.py="${SCRIPT_DIR}/compare_abc_results.py" \
     --from-file=profile.json="${PROFILE}" \
     --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "${NAMESPACE}" label configmap "${configmap_name}" \
+    app.kubernetes.io/name=pd-benchmark --overwrite
 
   log "creating benchmark pod=${pod_name} image=${VLLM_IMAGE}"
   sed \
