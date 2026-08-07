@@ -191,9 +191,20 @@ def generate_shared_prefix_workload(
     seed = int(profile.get("seed", 20260724))
     groups = _positive_int(data.get("num_groups"), "data.num_groups")
     prompts_per_group = _positive_int(data.get("prompts_per_group"), "data.prompts_per_group")
+    cache_fill_prompts_per_group = _positive_int(
+        data.get("cache_fill_prompts_per_group", prompts_per_group),
+        "data.cache_fill_prompts_per_group",
+    )
+    if cache_fill_prompts_per_group > prompts_per_group:
+        raise ValueError("data.cache_fill_prompts_per_group cannot exceed data.prompts_per_group")
     system_tokens = _positive_int(data.get("system_prompt_tokens"), "data.system_prompt_tokens")
     question_tokens = _positive_int(data.get("question_tokens"), "data.question_tokens")
     cache_fill_rate = float(load.get("cache_fill_rate", 10.0))
+    prefix_probe_rate = float(load.get("prefix_probe_rate", 0.0))
+    if prefix_probe_rate < 0:
+        raise ValueError("load.prefix_probe_rate must be non-negative")
+    if prefix_probe_rate > 0 and cache_fill_prompts_per_group >= prompts_per_group:
+        raise ValueError("load.prefix_probe_rate requires an unprimed prompt per group")
     stages = load.get("stages") or []
     if not isinstance(stages, list) or not stages:
         raise ValueError("load.stages must contain at least one QPS stage")
@@ -221,8 +232,12 @@ def generate_shared_prefix_workload(
 
     records: list[PlannedRequest] = []
     sequence = 0
-    cache_fill = list(corpus)
-    rng.shuffle(cache_fill)
+    cache_fill = [item for item in corpus if item[1] < cache_fill_prompts_per_group]
+    # Keep the QPS-stage random streams independent of the number of prime
+    # requests. Changing cache_fill_prompts_per_group must not silently change
+    # stage arrival offsets or prompt order.
+    cache_fill_rng = random.Random(seed ^ 0x5A17)
+    cache_fill_rng.shuffle(cache_fill)
     for index, (group_index, prompt_index, messages) in enumerate(cache_fill):
         records.append(
             PlannedRequest(
@@ -241,6 +256,27 @@ def generate_shared_prefix_workload(
             )
         )
         sequence += 1
+
+    if prefix_probe_rate > 0:
+        prefix_probe = [item for item in corpus if item[1] == cache_fill_prompts_per_group]
+        for index, (group_index, prompt_index, messages) in enumerate(prefix_probe):
+            records.append(
+                PlannedRequest(
+                    sequence=sequence,
+                    phase="measure",
+                    stage="prefix-probe",
+                    scheduled_offset_s=index / prefix_probe_rate,
+                    session_index=group_index * prompts_per_group + prompt_index,
+                    session_id=f"bench-shared-{seed}-probe-{group_index:05d}",
+                    turn=1,
+                    scenario="shared-prefix",
+                    send_session_key=False,
+                    messages=[dict(message) for message in messages],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            )
+            sequence += 1
 
     for stage_index, stage in enumerate(stages):
         if not isinstance(stage, dict):

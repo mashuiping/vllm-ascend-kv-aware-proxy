@@ -49,7 +49,8 @@ approximation; always report actual server `prompt_tokens` from results.
 The preferred runner uses the checked-in profiles under `benchmarks/profiles/`
 instead of the legacy `prefix-words` generator. See
 [`benchmarks/README.md`](../benchmarks/README.md) for exact-token generation,
-cache-fill phases, Poisson QPS stages and capacity sizing.
+cache-fill and prefix-probe phases, per-stage Poisson QPS results and capacity
+sizing.
 
 ## Required metrics
 
@@ -58,6 +59,7 @@ cache-fill phases, Poisson QPS stages and capacity sizing.
 - E2E p50, p95 and p99;
 - prompt, cached and computed tokens;
 - cached-token request rate and cached-token ratio;
+- per-stage cache and latency results for shared-prefix probes and QPS levels;
 - Prefill and Decode queue time;
 - request and token throughput;
 - per-Prefiller cache/query/load distribution;
@@ -76,6 +78,12 @@ stable route -> higher cached tokens -> less Prefill work -> lower warm TTFT
 
 If cached tokens rise but TTFT does not, inspect KV transfer, Decoder queueing
 and proxy overhead before widening affinity.
+
+The shared-prefix profile primes one prompt per group and measures a different
+same-prefix prompt in `prefix-probe`. This prevents the cache-fill phase from
+replicating every shared prefix onto all four Prefillers before the routing
+comparison. Its QPS stages are a continuous ramp; run each rate independently
+when the question is an isolated capacity point.
 
 ## Running
 

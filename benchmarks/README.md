@@ -11,7 +11,7 @@ random seed.
 | Profile                       | Shape                                                                                           | Purpose                                   |
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
-| `shared-prefix-capacity.json` | 32 groups × 8 prompts, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
+| `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -85,7 +85,7 @@ The prefix-locality profile builds a corpus of 32 groups with 8 prompts per
 group:
 
 ```text
-32 groups × 8 prompts = 256 cache-fill prompts
+32 groups × 8 prompts = 256 measured prompts
 ```
 
 Within one group, all eight prompts share the same 2,048-token system prompt
@@ -94,9 +94,17 @@ profile, so the test isolates cross-session prefix reuse and prefix-aware
 routing rather than session-key routing. Every request has `max_tokens=32` and
 `temperature=0.0`.
 
-The 256 cache-fill prompts are scheduled at 10 requests per second, with
-offsets `0.0s`, `0.1s`, ..., `25.5s`. The measured stages use deterministic
-Poisson inter-arrival offsets and a maximum of 64 in-flight requests:
+The cache-fill phase sends one representative prompt per group (32 requests).
+A following `prefix-probe` stage sends one different, previously unseen
+question per group. This keeps a shared prefix resident on one Prefiller before
+the probe: baseline has roughly a 1/4 chance of returning to that node, while
+prefix-aware routing should return to the owning node. The remaining corpus is
+replayed by the QPS stages. The probe is included in measured results and is
+reported separately under `per_stage.prefix-probe`.
+
+The cache-fill and prefix-probe requests are scheduled at 10 requests per
+second. The measured QPS stages use deterministic Poisson inter-arrival offsets
+and a maximum of 64 in-flight requests:
 
 
 | Stage    | Target rate | Duration | Expected requests |
@@ -109,8 +117,9 @@ Poisson inter-arrival offsets and a maximum of 64 in-flight requests:
 
 The Poisson generator keeps only arrivals whose offset is less than the stage
 duration, so the exact request count is allowed to vary around the expectation.
-With the checked-in seed, the current generated counts are 53, 153, 307, and
-595 respectively (1,108 measured requests plus 256 cache-fill requests).
+With the checked-in seed, the current generated counts are 60, 136, 309, and
+618 respectively (1,123 QPS requests, plus 32 prefix probes and 32 cache-fill
+requests, for 1,187 total requests).
 The configured rate is a request-start schedule; if 64 requests are already
 pending, the runner applies backpressure and the achieved rate can be lower
 than the target.
@@ -142,6 +151,7 @@ system warm-up (excluded)
   -> before metrics snapshot
   -> cache-fill
   -> after-cache-fill metrics snapshot
+  -> prefix-probe (shared-prefix only)
   -> measured turns or QPS stages
   -> final metrics snapshot
 ```
@@ -173,10 +183,12 @@ For `session-long`, turn 0 is `cache-fill` and later turns are `measure`. The
 assistant messages in later turns are fixed in the workload instead of copying
 live model output, so all groups receive byte-identical prompts.
 
-For `shared-prefix`, every group/prompt pair is sent once during `cache-fill`.
-Measured requests then replay the frozen corpus with deterministic Poisson
-arrival offsets. Session headers are disabled so this workload isolates prefix
-routing.
+For `shared-prefix`, one representative prompt per group is sent during
+`cache-fill`, followed by one previously unseen same-prefix prompt in
+`prefix-probe`. Measured QPS stages then replay the frozen corpus with
+deterministic Poisson arrival offsets. Session headers are disabled so this
+workload isolates prefix routing. The QPS stages are a continuous ramp and
+therefore share cache state; use separate runs for independent QPS points.
 
 ## Capacity sizing
 
@@ -186,6 +198,12 @@ Size a shared-prefix workload relative to aggregate Prefiller KV capacity:
 resident tokens ≈ groups × (system tokens + prompts per group × question tokens)
 working-set ratio = resident tokens / aggregate Prefiller KV token capacity
 ```
+
+The formula describes ideal prefix-affine placement. Without affinity, the
+shared system prefix can be duplicated on multiple Prefillers, increasing the
+effective working set and causing eviction earlier. Record KV capacity and
+usage from metrics; do not assume the default 32-group profile creates
+capacity pressure on every deployment.
 
 Run at approximately 25%, 50%, 75% and 110% to cover ample capacity, normal
 pressure, cache stress and eviction. Record the observed vLLM KV capacity and
@@ -302,7 +320,9 @@ runs the workload, and then proceeds to the next group. The workload itself is
 never regenerated between groups.
 
 Pod mode automatically supplies the four stable Prefill roots and all eight
-4P4D `/metrics` endpoints. Each group writes `reset-validation.json`,
+4P4D `/metrics` endpoints. Shared-prefix groups additionally require a cold
+cache-fill and a non-empty `prefix-probe` stage. Each group writes
+`reset-validation.json`,
 `reset-probe-requests.jsonl`, and `validity.json`. `comparison.json` and the
 HTML report are valid for performance claims only when all three group validity
 checks pass.

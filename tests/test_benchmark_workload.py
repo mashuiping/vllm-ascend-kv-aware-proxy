@@ -39,12 +39,14 @@ def shared_prefix_profile():
         "data": {
             "num_groups": 2,
             "prompts_per_group": 2,
+            "cache_fill_prompts_per_group": 1,
             "system_prompt_tokens": 32,
             "question_tokens": 8,
         },
         "load": {
             "type": "poisson",
             "cache_fill_rate": 10,
+            "prefix_probe_rate": 10,
             "stages": [{"name": "qps-20", "rate": 20, "duration": 1}],
         },
         "request": {"max_tokens": 4, "temperature": 0.0},
@@ -77,12 +79,15 @@ def test_session_workload_is_deterministic_and_freezes_history():
     assert warm.messages[-2] == {"role": "assistant", "content": "Fixed response."}
 
 
-def test_shared_prefix_workload_primes_full_corpus_then_runs_poisson_stage():
+def test_shared_prefix_workload_primes_one_prompt_per_group_then_probes_and_runs_poisson_stage():
     records = generate_workload(shared_prefix_profile(), TokenTextFactory())
     cache_fill = [record for record in records if record.phase == "cache-fill"]
+    prefix_probe = [record for record in records if record.stage == "prefix-probe"]
     measured = [record for record in records if record.phase == "measure"]
 
-    assert len(cache_fill) == 4
+    assert len(cache_fill) == 2
+    assert len(prefix_probe) == 2
+    assert all(record.session_index % 2 == 1 for record in prefix_probe)
     assert measured
     assert all(record.send_session_key is False for record in records)
     systems_by_group = {}
@@ -91,9 +96,9 @@ def test_shared_prefix_workload_primes_full_corpus_then_runs_poisson_stage():
         systems_by_group.setdefault(group, set()).add(record.messages[0]["content"])
     assert all(len(systems) == 1 for systems in systems_by_group.values())
     assert systems_by_group[0] != systems_by_group[1]
-    assert [record.scheduled_offset_s for record in measured] == sorted(
-        record.scheduled_offset_s for record in measured
-    )
+    for stage in {record.stage for record in measured}:
+        offsets = [record.scheduled_offset_s for record in measured if record.stage == stage]
+        assert offsets == sorted(offsets)
 
 
 def test_workload_jsonl_round_trip_and_manifest(tmp_path: Path):

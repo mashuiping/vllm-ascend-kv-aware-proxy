@@ -118,6 +118,11 @@ def format_percent(value: Any) -> str:
 def metric_definition(path: str) -> tuple[str, str, str]:
     if path in METRIC_LABELS:
         return METRIC_LABELS[path]
+    if path.startswith("per_stage."):
+        _, stage, *suffix = path.split(".")
+        base_path = "warm_turns." + ".".join(suffix)
+        label, unit, direction = METRIC_LABELS.get(base_path, (".".join(suffix), "", "higher"))
+        return f"{stage} · {label}", unit, direction
     return path, "", "higher"
 
 
@@ -153,22 +158,25 @@ def metric_rows(comparison: dict[str, Any], experiment_valid: bool = True) -> li
 
 def summary_card(group: str, summary: dict[str, Any]) -> str:
     warm = summary.get("warm_turns") or {}
+    prefix_probe = (summary.get("per_stage") or {}).get("prefix-probe") or {}
+    focus = prefix_probe if prefix_probe else warm
+    focus_label = "prefix-probe" if prefix_probe else "warm turns"
     overall = summary.get("overall") or {}
     success_rate = format_value(overall.get("success_rate"), "%")
     warm_e2e_p95 = format_value((warm.get("e2e_ms") or {}).get("p95"), "ms")
-    cached_ratio = format_value(warm.get("cached_token_ratio"), "%")
+    cached_ratio = format_value(focus.get("cached_token_ratio"), "%")
     request_throughput = format_value(warm.get("request_throughput_per_second"), "req/s")
     return "".join(
         [
             '<article class="card">',
             f"<h3>{html.escape(GROUP_LABELS[group])}</h3>",
-            f'<div class="big">{html.escape(format_value(warm.get("ttft_ms", {}).get("p95"), "ms"))}</div>',
-            '<div class="caption">warm TTFT p95</div>',
+            f'<div class="big">{html.escape(format_value(focus.get("ttft_ms", {}).get("p95"), "ms"))}</div>',
+            f'<div class="caption">{html.escape(focus_label)} TTFT p95</div>',
             "<dl>",
             f'<dt>Requests</dt><dd>{html.escape(str(overall.get("requests", "—")))}</dd>',
             f"<dt>Success rate</dt><dd>{html.escape(success_rate)}</dd>",
             f"<dt>Warm E2E p95</dt><dd>{html.escape(warm_e2e_p95)}</dd>",
-            f"<dt>Cached token ratio</dt><dd>{html.escape(cached_ratio)}</dd>",
+            f"<dt>{html.escape(focus_label)} cached ratio</dt><dd>{html.escape(cached_ratio)}</dd>",
             f"<dt>Request throughput</dt><dd>{html.escape(request_throughput)}</dd>",
             "</dl>",
             "</article>",
@@ -185,6 +193,20 @@ def phase_overview(summaries: dict[str, dict[str, Any]]) -> str:
                 "<tr>"
                 f"<td>{html.escape(GROUP_LABELS[group])}</td>"
                 f"<td>{html.escape(label)}</td>"
+                f'<td>{html.escape(str(summary.get("requests", "—")))}</td>'
+                f'<td>{html.escape(format_value(summary.get("success_rate"), "%"))}</td>'
+                f'<td>{html.escape(format_value((summary.get("ttft_ms") or {}).get("p95"), "ms"))}</td>'
+                f'<td>{html.escape(format_value((summary.get("e2e_ms") or {}).get("p95"), "ms"))}</td>'
+                f'<td>{html.escape(format_value(summary.get("cached_token_ratio"), "%"))}</td>'
+                "</tr>"
+            )
+        for stage, summary in sorted((summaries[group].get("per_stage") or {}).items()):
+            if stage == "cache-fill":
+                continue
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(GROUP_LABELS[group])}</td>"
+                f"<td>{html.escape(stage)}</td>"
                 f'<td>{html.escape(str(summary.get("requests", "—")))}</td>'
                 f'<td>{html.escape(format_value(summary.get("success_rate"), "%"))}</td>'
                 f'<td>{html.escape(format_value((summary.get("ttft_ms") or {}).get("p95"), "ms"))}</td>'

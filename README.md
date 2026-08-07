@@ -168,7 +168,9 @@ caches, verifies all four Prefillers are cold with direct probes, records
 cache-fill separately and then measures warm turns or QPS stages. Pod mode also
 captures every 4P4D metrics endpoint and marks comparisons invalid when reset
 or isolation checks fail. See [benchmarks/README.md](benchmarks/README.md) for
-workload details.
+workload details. The shared-prefix profile uses one prime and one prefix probe
+per group, then reports each QPS stage separately so the baseline cannot be
+judged only from its later fully-warmed state.
 
 ```bash
 export PREFILL_NODE='your-prefill-node'

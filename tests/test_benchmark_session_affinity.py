@@ -74,6 +74,38 @@ def test_latency_summary_treats_missing_cached_tokens_as_cache_miss():
     assert summary["cached_tokens_field_rate"] == 0.25
 
 
+def test_compare_summaries_includes_shared_prefix_stage_metrics():
+    baseline = {
+        "per_stage": {
+            "prefix-probe": {
+                "ttft_ms": {"p95": 100.0},
+                "e2e_ms": {"p95": 120.0},
+                "cached_token_request_rate": 0.25,
+                "cached_token_ratio": 0.2,
+                "client_computed_tokens": {"mean": 80.0},
+                "request_throughput_per_second": 10.0,
+            }
+        }
+    }
+    treatment = {
+        "per_stage": {
+            "prefix-probe": {
+                "ttft_ms": {"p95": 50.0},
+                "e2e_ms": {"p95": 70.0},
+                "cached_token_request_rate": 1.0,
+                "cached_token_ratio": 0.9,
+                "client_computed_tokens": {"mean": 20.0},
+                "request_throughput_per_second": 12.0,
+            }
+        }
+    }
+
+    comparison = benchmark.compare_summaries(baseline, treatment)
+
+    assert comparison["per_stage.prefix-probe.cached_token_request_rate"]["improvement"] == 3.0
+    assert comparison["per_stage.prefix-probe.ttft_ms.p95"]["improvement"] == 0.5
+
+
 def test_parse_prometheus_aggregates_backends_and_ignores_unrelated_metrics():
     parsed = benchmark.parse_prometheus(
         """

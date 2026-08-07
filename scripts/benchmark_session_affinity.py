@@ -1043,7 +1043,7 @@ def nested_number(value: dict[str, Any], path: str) -> float | None:
 
 
 def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> dict[str, Any]:
-    paths = (
+    paths = [
         "warm_turns.ttft_ms.p50",
         "warm_turns.ttft_ms.p95",
         "warm_turns.ttft_ms.p99",
@@ -1063,7 +1063,20 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
         ("proxy_prefill_load_balance_measurement.session_affinity_stats_delta." "derived_overload_fallback_rate"),
         ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_prefix_hit_rate"),
         ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_spillover_rate"),
-    )
+    ]
+    baseline_stages = set((baseline.get("per_stage") or {}).keys())
+    treatment_stages = set((treatment.get("per_stage") or {}).keys())
+    for stage in sorted(baseline_stages & treatment_stages):
+        paths.extend(
+            [
+                f"per_stage.{stage}.ttft_ms.p95",
+                f"per_stage.{stage}.e2e_ms.p95",
+                f"per_stage.{stage}.cached_token_request_rate",
+                f"per_stage.{stage}.cached_token_ratio",
+                f"per_stage.{stage}.client_computed_tokens.mean",
+                f"per_stage.{stage}.request_throughput_per_second",
+            ]
+        )
     comparison: dict[str, Any] = {}
     lower_is_better = (
         "ttft",
@@ -1489,6 +1502,13 @@ def main() -> int:
     }
     if scenario == "session-long" and args.reset_before:
         required_checks["cold_turn_has_no_cache_hits"] = summary["cold_turn"]["cached_token_request_rate"] == 0
+    if scenario == "shared-prefix" and args.reset_before:
+        required_checks["shared_prefix_prime_has_no_cache_hits"] = (
+            summary["cache_fill"]["cached_token_request_rate"] == 0
+        )
+        required_checks["shared_prefix_probe_present"] = (
+            summary["per_stage"].get("prefix-probe", {}).get("requests", 0) > 0
+        )
     validity = {
         "valid": all(required_checks.values()),
         "checks": required_checks,
