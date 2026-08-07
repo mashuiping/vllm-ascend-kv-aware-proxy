@@ -12,6 +12,7 @@ random seed.
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
+| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, continuous Poisson overlap at 8/16/24 QPS, concurrency 64 | A/B Prefill active-token load balancing |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -78,6 +79,46 @@ pool with `max_workers=20`, submits the 60 requests for one turn, and waits for
 that turn to finish before starting the next turn. At most 20 requests are in
 flight; there is no think-time delay between turns unless explicitly supplied
 to the runner.
+
+### `load-balance-active-tokens.json`
+
+This profile is designed to expose the transient Prefill load signal in B
+(`candidate-off`) versus A (`baseline`). It is not a cache-locality test:
+every request has a unique prompt, session headers are disabled, and the
+primary comparison is Prefill queue time, TTFT tail latency and per-node load
+balance.
+
+The workload cycles through three prompt-size classes (512, 2,048 and 4,096
+system tokens, with correspondingly different user inputs) while requests
+arrive according to deterministic Poisson offsets:
+
+| Stage | Target rate | Duration | Concurrency |
+| ----- | ----------- | -------- | ----------- |
+| `qps-8` | 8 req/s | 15 s | 64 |
+| `qps-16` | 16 req/s | 15 s | 64 |
+| `qps-24` | 24 req/s | 15 s | 64 |
+
+With the checked-in seed, these stages generate 120, 235 and 324 requests
+respectively (679 total). The exact count is deterministic, while the
+inter-arrival offsets remain Poisson-distributed within each stage.
+
+The generated system and user messages are unique per request, so cache hits
+should remain negligible. The different prompt sizes create overlapping
+Prefill work; B can then avoid selecting a node whose active Prefill compute
+load is high even when its KV load alone appears low. C is still run by the
+standard A/B/C script, but its affinity result is only a reference for this
+profile.
+
+Run it with the normal orchestrator:
+
+```bash
+bash scripts/run_abc_experiment.sh \
+  benchmarks/profiles/load-balance-active-tokens.json
+```
+
+For a stronger stress point, repeat with `CONCURRENCY=128`. Compare A and B by
+stage, focusing on Prefill queue time, TTFT p95/p99 and the per-Prefiller load
+distribution; do not use cache-hit rate as the success metric.
 
 ### `shared-prefix-capacity.json`
 

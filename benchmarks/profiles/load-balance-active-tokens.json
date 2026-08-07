@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "name": "load-balance-active-tokens",
+  "scenario": "load-balance",
+  "seed": 20260724,
+  "data": {
+    "prompt_classes": [
+      {
+        "name": "short",
+        "system_prompt_tokens": 512,
+        "turn_input_tokens": 128
+      },
+      {
+        "name": "medium",
+        "system_prompt_tokens": 2048,
+        "turn_input_tokens": 256
+      },
+      {
+        "name": "long",
+        "system_prompt_tokens": 4096,
+        "turn_input_tokens": 512
+      }
+    ]
+  },
+  "load": {
+    "type": "poisson-overlap",
+    "concurrency": 64,
+    "stages": [
+      {
+        "name": "qps-8",
+        "rate": 8,
+        "duration": 15
+      },
+      {
+        "name": "qps-16",
+        "rate": 16,
+        "duration": 15
+      },
+      {
+        "name": "qps-24",
+        "rate": 24,
+        "duration": 15
+      }
+    ]
+  },
+  "request": {
+    "max_tokens": 8,
+    "temperature": 0.0
+  }
+}

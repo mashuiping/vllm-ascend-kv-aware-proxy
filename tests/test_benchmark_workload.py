@@ -53,6 +53,27 @@ def shared_prefix_profile():
     }
 
 
+def load_balance_profile():
+    return {
+        "version": 1,
+        "name": "load-balance-test",
+        "scenario": "load-balance",
+        "seed": 44,
+        "data": {
+            "prompt_classes": [
+                {"name": "short", "system_prompt_tokens": 16, "turn_input_tokens": 4},
+                {"name": "long", "system_prompt_tokens": 32, "turn_input_tokens": 8},
+            ]
+        },
+        "load": {
+            "type": "poisson-overlap",
+            "concurrency": 4,
+            "stages": [{"name": "qps-20", "rate": 20, "duration": 1}],
+        },
+        "request": {"max_tokens": 4, "temperature": 0.0},
+    }
+
+
 def test_token_text_factory_uses_exact_token_round_trip():
     factory = TokenTextFactory(
         tokenize=lambda text: list(text.encode("utf-8")),
@@ -98,6 +119,21 @@ def test_shared_prefix_workload_primes_one_prompt_per_group_then_probes_and_runs
     assert systems_by_group[0] != systems_by_group[1]
     for stage in {record.stage for record in measured}:
         offsets = [record.scheduled_offset_s for record in measured if record.stage == stage]
+        assert offsets == sorted(offsets)
+
+
+def test_load_balance_workload_is_unique_heterogeneous_and_continuous():
+    records = generate_workload(load_balance_profile(), TokenTextFactory())
+
+    assert records
+    assert all(record.scenario == "load-balance" for record in records)
+    assert all(record.phase == "measure" for record in records)
+    assert all(record.send_session_key is False for record in records)
+    assert len({record.session_id for record in records}) == len(records)
+    assert len({record.messages[0]["content"] for record in records}) == len(records)
+    assert len({len(record.messages[0]["content"]) for record in records}) > 1
+    for stage in {record.stage for record in records}:
+        offsets = [record.scheduled_offset_s for record in records if record.stage == stage]
         assert offsets == sorted(offsets)
 
 

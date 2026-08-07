@@ -89,8 +89,8 @@ def load_profile(path: Path) -> dict[str, Any]:
         raise ValueError("workload profile must be a JSON object")
     if profile.get("version") != WORKLOAD_VERSION:
         raise ValueError(f"unsupported workload profile version: {profile.get('version')!r}")
-    if profile.get("scenario") not in ("session-long", "shared-prefix"):
-        raise ValueError("profile scenario must be session-long or shared-prefix")
+    if profile.get("scenario") not in ("session-long", "shared-prefix", "load-balance"):
+        raise ValueError("profile scenario must be session-long, shared-prefix, or load-balance")
     return profile
 
 
@@ -310,13 +310,101 @@ def generate_shared_prefix_workload(
     return records
 
 
+def generate_load_balance_workload(
+    profile: dict[str, Any],
+    text_factory: TokenTextFactory,
+) -> list[PlannedRequest]:
+    """Generate a continuous, heterogeneous Prefill workload.
+
+    Every request has a unique system prompt and no session header, so this
+    profile measures transient Prefill load placement instead of cache
+    affinity. Prompt classes intentionally have different token sizes; the
+    resulting overlap gives candidate-off a chance to use its active-token
+    accounting while the request is still in Prefill.
+    """
+    data = profile.get("data") or {}
+    load = profile.get("load") or {}
+    seed = int(profile.get("seed", 20260724))
+    prompt_classes = data.get("prompt_classes") or []
+    if not isinstance(prompt_classes, list) or not prompt_classes:
+        raise ValueError("data.prompt_classes must contain at least one prompt class")
+    classes: list[tuple[str, int, int]] = []
+    for index, prompt_class in enumerate(prompt_classes):
+        if not isinstance(prompt_class, dict):
+            raise ValueError("every data.prompt_classes entry must be an object")
+        name = str(prompt_class.get("name") or f"class-{index}")
+        system_tokens = _positive_int(
+            prompt_class.get("system_prompt_tokens"),
+            f"data.prompt_classes[{index}].system_prompt_tokens",
+        )
+        input_tokens = _positive_int(
+            prompt_class.get("turn_input_tokens"),
+            f"data.prompt_classes[{index}].turn_input_tokens",
+        )
+        classes.append((name, system_tokens, input_tokens))
+
+    stages = load.get("stages") or []
+    if not isinstance(stages, list) or not stages:
+        raise ValueError("load.stages must contain at least one QPS stage")
+    max_tokens, temperature = _request_settings(profile)
+    rng = random.Random(seed)
+    records: list[PlannedRequest] = []
+    sequence = 0
+    for stage_index, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            raise ValueError("every load stage must be an object")
+        rate = float(stage.get("rate", 0.0))
+        duration = float(stage.get("duration", 0.0))
+        if rate <= 0 or duration <= 0:
+            raise ValueError("load stage rate and duration must be positive")
+        stage_name = str(stage.get("name") or f"qps-{rate:g}")
+        stage_rng = random.Random(rng.randrange(2**63))
+        offsets = _poisson_offsets(rate, duration, stage_rng)
+        for request_index, offset in enumerate(offsets):
+            class_name, system_tokens, input_tokens = classes[
+                (request_index + stage_index) % len(classes)
+            ]
+            label = f"load-balance-{seed}-{stage_index:03d}-{request_index:08d}-{class_name}"
+            records.append(
+                PlannedRequest(
+                    sequence=sequence,
+                    phase="measure",
+                    stage=stage_name,
+                    scheduled_offset_s=offset,
+                    session_index=sequence,
+                    session_id=f"bench-load-balance-{seed}-{sequence:08d}",
+                    turn=stage_index,
+                    scenario="load-balance",
+                    send_session_key=False,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": text_factory.make(f"{label}-system", system_tokens),
+                        },
+                        {
+                            "role": "user",
+                            "content": text_factory.make(f"{label}-input", input_tokens),
+                        },
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            )
+            sequence += 1
+    if not records:
+        raise ValueError("load-balance stages produced no requests")
+    return records
+
+
 def generate_workload(
     profile: dict[str, Any],
     text_factory: TokenTextFactory,
 ) -> list[PlannedRequest]:
     if profile["scenario"] == "session-long":
         return generate_session_workload(profile, text_factory)
-    return generate_shared_prefix_workload(profile, text_factory)
+    if profile["scenario"] == "shared-prefix":
+        return generate_shared_prefix_workload(profile, text_factory)
+    return generate_load_balance_workload(profile, text_factory)
 
 
 def write_workload_jsonl(path: Path, records: Iterable[PlannedRequest]) -> None:

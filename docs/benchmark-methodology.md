@@ -37,6 +37,7 @@ benchmark command, per-Prefiller reset outcome and experiment validity result.
 | --- | --- |
 | `session-long` | Main multi-turn session-locality case |
 | `shared-prefix` | Cross-session shared system-prompt locality |
+| `load-balance` | Continuous heterogeneous Prefill load for A/B active-token scoring |
 | `short` | Negative control below useful cache granularity |
 | `one-shot` | Measures overhead and LRU pollution without reuse |
 | `hot-key` | Exposes hotspot risk without spillover |
