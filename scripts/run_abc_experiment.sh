@@ -86,6 +86,8 @@ run_local() {
 
   log "comparing baseline, candidate-off, and candidate-on"
   "${PYTHON_BIN}" "${SCRIPT_DIR}/compare_abc_results.py" "${experiment_dir}"
+  log "rendering HTML report"
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/render_benchmark_report.py" "${experiment_dir}"
 }
 
 deploy_proxy_group() {
@@ -133,7 +135,11 @@ run_in_pod() {
     if (( status != 0 )); then
       log "benchmark failed; keeping pod/${pod_name} and configmap/${configmap_name} for inspection"
       log "inspect with: kubectl -n ${NAMESPACE} exec -it ${pod_name} -- bash"
-      log "recover results with: kubectl -n ${NAMESPACE} cp ${pod_name}:/results/. ${experiment_dir}"
+      log "recover results with:"
+      log "  kubectl -n ${NAMESPACE} exec ${pod_name} -- tar -C /results -czf /tmp/benchmark-results.tar.gz ."
+      log "  kubectl -n ${NAMESPACE} cp ${pod_name}:/tmp/benchmark-results.tar.gz ${experiment_dir}/benchmark-results.tar.gz"
+      log "  tar -xzf ${experiment_dir}/benchmark-results.tar.gz -C ${experiment_dir}"
+      log "  rm -f ${experiment_dir}/benchmark-results.tar.gz"
     fi
   }
   trap on_exit EXIT
@@ -195,8 +201,22 @@ run_in_pod() {
   kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
     python /opt/benchmark/compare_abc_results.py /results
 
-  log "copying benchmark artifacts to ${experiment_dir}"
-  kubectl -n "${NAMESPACE}" cp "${pod_name}:/results/." "${experiment_dir}"
+  local archive_name="benchmark-results.tar.gz"
+  local remote_archive="/tmp/${archive_name}"
+  local local_archive="${experiment_dir}/${archive_name}"
+
+  log "archiving benchmark artifacts inside pod"
+  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+    tar -C /results -czf "${remote_archive}" .
+  log "copying compressed archive to ${local_archive}"
+  kubectl -n "${NAMESPACE}" cp "${pod_name}:${remote_archive}" "${local_archive}"
+  log "extracting archive into ${experiment_dir}"
+  tar -xzf "${local_archive}" -C "${experiment_dir}"
+  rm -f "${local_archive}"
+  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- rm -f "${remote_archive}" || true
+
+  log "rendering HTML report"
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/render_benchmark_report.py" "${experiment_dir}"
 
   if [[ "${KEEP_BENCHMARK_POD:-false}" == "true" ]]; then
     log "keeping benchmark pod=${pod_name} by request"
