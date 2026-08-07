@@ -94,6 +94,26 @@ def load_profile(path: Path) -> dict[str, Any]:
     return profile
 
 
+def override_system_prompt_tokens(
+    profile: dict[str, Any],
+    system_prompt_tokens: int | None,
+) -> dict[str, Any]:
+    """Return a profile copy with an optional system-prompt size override."""
+    if system_prompt_tokens is None:
+        return profile
+    if system_prompt_tokens <= 0:
+        raise ValueError("system_prompt_tokens override must be positive")
+    data = profile.get("data")
+    if not isinstance(data, dict) or "system_prompt_tokens" not in data:
+        raise ValueError(
+            "system_prompt_tokens override is supported only for profiles with data.system_prompt_tokens"
+        )
+    effective = dict(profile)
+    effective["data"] = dict(data)
+    effective["data"]["system_prompt_tokens"] = system_prompt_tokens
+    return effective
+
+
 def _positive_int(value: Any, name: str) -> int:
     result = int(value)
     if result <= 0:

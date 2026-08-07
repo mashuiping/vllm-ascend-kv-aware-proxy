@@ -19,6 +19,7 @@ try:
         TokenTextFactory,
         generate_workload,
         load_profile,
+        override_system_prompt_tokens,
         workload_manifest,
         write_workload_jsonl,
     )
@@ -27,6 +28,7 @@ except ModuleNotFoundError:  # Imported as scripts.generate_benchmark_workload i
         TokenTextFactory,
         generate_workload,
         load_profile,
+        override_system_prompt_tokens,
         workload_manifest,
         write_workload_jsonl,
     )
@@ -103,6 +105,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--insecure", action="store_true")
+    system_prompt_env = os.environ.get("SYSTEM_PROMPT_TOKENS")
+    if system_prompt_env:
+        try:
+            system_prompt_default = int(system_prompt_env)
+        except ValueError:
+            parser.error("SYSTEM_PROMPT_TOKENS must be a positive integer")
+    else:
+        system_prompt_default = None
+    parser.add_argument(
+        "--system-prompt-tokens",
+        type=int,
+        default=system_prompt_default,
+        help="Override data.system_prompt_tokens without editing the profile (also reads SYSTEM_PROMPT_TOKENS).",
+    )
     parser.add_argument(
         "--allow-unverified-token-counts",
         action="store_true",
@@ -116,12 +132,14 @@ def parse_args() -> argparse.Namespace:
             "--tokenizer-url is required for production workloads; "
             "use --allow-unverified-token-counts only for local smoke tests"
         )
+    if args.system_prompt_tokens is not None and args.system_prompt_tokens <= 0:
+        parser.error("--system-prompt-tokens must be a positive integer")
     return args
 
 
 def main() -> int:
     args = parse_args()
-    profile = load_profile(args.profile)
+    profile = override_system_prompt_tokens(load_profile(args.profile), args.system_prompt_tokens)
     started = time.monotonic()
     print(
         f"[workload] loading profile={args.profile} tokenizer={args.tokenizer_url or 'unverified-smoke'}",

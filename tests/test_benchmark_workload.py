@@ -7,6 +7,7 @@ from scripts.benchmark_workload import (
     TokenTextFactory,
     generate_workload,
     load_workload_jsonl,
+    override_system_prompt_tokens,
     workload_manifest,
     write_workload_jsonl,
 )
@@ -98,6 +99,21 @@ def test_session_workload_is_deterministic_and_freezes_history():
     assert len({record.session_id for record in first}) == 3
     warm = next(record for record in first if record.turn == 1)
     assert warm.messages[-2] == {"role": "assistant", "content": "Fixed response."}
+
+
+def test_system_prompt_override_changes_only_effective_profile():
+    profile = session_profile()
+
+    overridden = override_system_prompt_tokens(profile, 64)
+
+    assert profile["data"]["system_prompt_tokens"] == 32
+    assert overridden["data"]["system_prompt_tokens"] == 64
+    assert overridden["load"] == profile["load"]
+
+
+def test_system_prompt_override_requires_supported_profile_shape():
+    with pytest.raises(ValueError, match="data.system_prompt_tokens"):
+        override_system_prompt_tokens(load_balance_profile(), 64)
 
 
 def test_shared_prefix_workload_primes_one_prompt_per_group_then_probes_and_runs_poisson_stage():

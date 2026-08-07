@@ -50,6 +50,11 @@ profile_concurrency="$("${PYTHON_BIN}" -c \
   'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("load", {}).get("concurrency", 64))' \
   "${PROFILE}")"
 concurrency="${CONCURRENCY:-${profile_concurrency}}"
+workload_override_args=()
+if [[ -n "${SYSTEM_PROMPT_TOKENS:-}" ]]; then
+  workload_override_args=(--system-prompt-tokens "${SYSTEM_PROMPT_TOKENS}")
+  log "overriding data.system_prompt_tokens=${SYSTEM_PROMPT_TOKENS} for generated workload"
+fi
 read -r -a groups <<<"${GROUP_ORDER:-baseline candidate-off candidate-on}"
 
 if (( ${#groups[@]} != 3 )); then
@@ -80,7 +85,8 @@ run_local() {
     --output "${workload_file}" \
     --tokenizer-url "${TOKENIZER_URL}" \
     --model "${MODEL}" \
-    --timeout "${TOKENIZER_TIMEOUT:-120}"
+    --timeout "${TOKENIZER_TIMEOUT:-120}" \
+    "${workload_override_args[@]}"
   log "shared workload generated: ${workload_file}"
 
   local group
@@ -195,7 +201,8 @@ run_in_pod() {
       --output "${workload_file}" \
       --tokenizer-url "${tokenizer_url}" \
       --model "${MODEL}" \
-      --timeout "${TOKENIZER_TIMEOUT:-120}"
+      --timeout "${TOKENIZER_TIMEOUT:-120}" \
+      "${workload_override_args[@]}"
 
   local group
   for group in "${groups[@]}"; do

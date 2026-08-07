@@ -39,6 +39,23 @@ python scripts/generate_benchmark_workload.py \
   --allow-unverified-token-counts
 ```
 
+For the session and shared-prefix profiles, `data.system_prompt_tokens` can be
+overridden at runtime without editing the JSON file. Set the environment
+variable on the experiment command; the value is applied once while generating
+the shared workload used by all three groups:
+
+```bash
+SYSTEM_PROMPT_TOKENS=8192 \
+bash scripts/run_abc_experiment.sh \
+  benchmarks/profiles/session-affinity.json
+```
+
+The same override works with `shared-prefix-capacity.json`. The generated
+manifest records the effective profile, while the checked-in profile remains
+unchanged. It is intentionally not supported by the heterogeneous
+`load-balance-active-tokens.json` profile, whose prompt sizes are defined by
+its individual prompt classes.
+
 
 
 ## Dataset construction and load model
