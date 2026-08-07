@@ -258,6 +258,78 @@ def test_affinity_lru_eviction_removal_and_reset():
     assert scheduler.prefix_lru == {}
 
 
+def test_reset_prefix_cache_reports_every_prefill(monkeypatch):
+    scheduler = make_scheduler()
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"success": true}'
+
+        def json(self):
+            return {"success": True}
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    class FakeRuntime:
+        def __init__(self):
+            self.scheduler = scheduler
+
+        async def sync_clients(self):
+            return None
+
+        async def get_client(self, _role, _key):
+            return FakeClient()
+
+    monkeypatch.setattr(proxy, "get_runtime", lambda: FakeRuntime())
+    response = asyncio.run(proxy.reset_prefix_cache(SimpleNamespace(query_params={})))
+    payload = __import__("json").loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["success"] is True
+    assert len(payload["backends"]) == 2
+
+
+def test_reset_prefix_cache_rejects_explicit_backend_failure(monkeypatch):
+    scheduler = make_scheduler()
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"success": false}'
+
+        def json(self):
+            return {"success": False}
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    class FakeRuntime:
+        def __init__(self):
+            self.scheduler = scheduler
+
+        async def sync_clients(self):
+            return None
+
+        async def get_client(self, _role, _key):
+            return FakeClient()
+
+    monkeypatch.setattr(proxy, "get_runtime", lambda: FakeRuntime())
+    response = asyncio.run(proxy.reset_prefix_cache(SimpleNamespace(query_params={})))
+    payload = __import__("json").loads(response.body)
+
+    assert response.status_code == 500
+    assert payload["success"] is False
+    assert len(payload["failed"]) == 2
+
+
 def test_extract_reusable_prefix_tokens_sums_cached_and_created():
     response = {
         "usage": {
@@ -312,9 +384,7 @@ def test_extract_reusable_prefix_tokens_incomplete_returns_none(response):
 def test_complete_prefill_with_allow_affinity_false_does_not_bind_session():
     scheduler = make_scheduler()
     first = scheduler.begin_request(10.0, 10.0, "session")
-    scheduler.complete_prefill(
-        first["key"], 10.0, "session", None, route_source="session", allow_affinity=False
-    )
+    scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="session", allow_affinity=False)
     scheduler.release_prefill_kv(first["key"], 10.0)
     assert scheduler.session_lru == {}
 
@@ -322,9 +392,7 @@ def test_complete_prefill_with_allow_affinity_false_does_not_bind_session():
 def test_complete_prefill_with_allow_affinity_false_does_not_bind_prefix():
     scheduler = make_scheduler()
     first = scheduler.begin_request(10.0, 10.0, None, "prefix")
-    scheduler.complete_prefill(
-        first["key"], 10.0, None, "prefix", route_source="prefix", allow_affinity=False
-    )
+    scheduler.complete_prefill(first["key"], 10.0, None, "prefix", route_source="prefix", allow_affinity=False)
     scheduler.release_prefill_kv(first["key"], 10.0)
     assert scheduler.prefix_lru == {}
 
@@ -337,20 +405,14 @@ def test_complete_prefill_allow_affinity_false_preserves_existing_bindings():
     scheduler.release_prefill_kv(first["key"], 10.0)
 
     second = scheduler.begin_request(10.0, 10.0, "session")
-    scheduler.complete_prefill(
-        second["key"], 10.0, "session", None, route_source="session", allow_affinity=False
-    )
+    scheduler.complete_prefill(second["key"], 10.0, "session", None, route_source="session", allow_affinity=False)
     scheduler.release_prefill_kv(second["key"], 10.0)
     assert scheduler.session_lru["session"] == bound
 
 
 def test_assign_instances_with_gate_off_binds_even_when_reusable_is_zero(monkeypatch):
     scheduler = make_scheduler()
-    response_payload = {
-        "usage": {
-            "prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0}
-        }
-    }
+    response_payload = {"usage": {"prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0}}}
 
     class FakeResponse:
         def __init__(self, payload):
@@ -387,13 +449,17 @@ def test_assign_instances_with_gate_off_binds_even_when_reusable_is_zero(monkeyp
 
     runtime = FakeRuntime()
     monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
-    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(
-        max_retries=0,
-        retry_delay=0,
-        enable_kv_cache_aware_routing=True,
-        enable_reusable_prefix_affinity_gate=False,
-        prefix_hash_chars=0,
-    ))
+    monkeypatch.setattr(
+        proxy,
+        "get_global_args",
+        lambda: SimpleNamespace(
+            max_retries=0,
+            retry_delay=0,
+            enable_kv_cache_aware_routing=True,
+            enable_reusable_prefix_affinity_gate=False,
+            prefix_hash_chars=0,
+        ),
+    )
     monkeypatch.setattr(proxy, "send_request_to_service", fake_send_request)
 
     instance_info = asyncio.run(
@@ -416,11 +482,7 @@ def test_assign_instances_with_gate_off_binds_even_when_reusable_is_zero(monkeyp
 
 def test_assign_instances_with_gate_on_skips_bind_when_reusable_zero(monkeypatch):
     scheduler = make_scheduler()
-    response_payload = {
-        "usage": {
-            "prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0}
-        }
-    }
+    response_payload = {"usage": {"prompt_tokens_details": {"cached_tokens": 0, "created_cache_tokens": 0}}}
 
     class FakeResponse:
         def __init__(self, payload):
@@ -451,13 +513,17 @@ def test_assign_instances_with_gate_on_skips_bind_when_reusable_zero(monkeypatch
 
     runtime = FakeRuntime()
     monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
-    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(
-        max_retries=0,
-        retry_delay=0,
-        enable_kv_cache_aware_routing=True,
-        enable_reusable_prefix_affinity_gate=True,
-        prefix_hash_chars=0,
-    ))
+    monkeypatch.setattr(
+        proxy,
+        "get_global_args",
+        lambda: SimpleNamespace(
+            max_retries=0,
+            retry_delay=0,
+            enable_kv_cache_aware_routing=True,
+            enable_reusable_prefix_affinity_gate=True,
+            prefix_hash_chars=0,
+        ),
+    )
     monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
 
     s_key = "body:session_id:s1"
@@ -508,13 +574,17 @@ def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monk
 
     runtime = FakeRuntime()
     monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
-    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(
-        max_retries=0,
-        retry_delay=0,
-        enable_kv_cache_aware_routing=True,
-        enable_reusable_prefix_affinity_gate=True,
-        prefix_hash_chars=0,
-    ))
+    monkeypatch.setattr(
+        proxy,
+        "get_global_args",
+        lambda: SimpleNamespace(
+            max_retries=0,
+            retry_delay=0,
+            enable_kv_cache_aware_routing=True,
+            enable_reusable_prefix_affinity_gate=True,
+            prefix_hash_chars=0,
+        ),
+    )
     monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
 
     s_key = "body:session_id:s1"
@@ -535,7 +605,4 @@ def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monk
         instance_info.decoder_score,
     )
     assert s_key in scheduler.session_lru
-    assert any(
-        "reusable_prefix_tokens" in record.getMessage()
-        for record in caplog.records
-    )
+    assert any("reusable_prefix_tokens" in record.getMessage() for record in caplog.records)

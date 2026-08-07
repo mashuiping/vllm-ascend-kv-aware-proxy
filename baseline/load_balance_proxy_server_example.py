@@ -135,7 +135,7 @@ from typing import Any, cast
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -1199,18 +1199,44 @@ async def reset_prefix_cache(request: Request):
     # Prefillers own the prefix KV in this PD topology; Decoders run with
     # --no-enable-prefix-caching, so fan-out to decode is unnecessary.
     failures: list[str] = []
+    backends: list[dict[str, Any]] = []
     for server in snapshot["prefill_instances"]:
         base_url = build_server_url(server["host"], server["port"])
+        started = time.monotonic()
+        result: dict[str, Any] = {"target": base_url}
         try:
             client = await runtime.get_client(ServerRole.PREFILL, server_key(server["host"], server["port"]))
             resp = await client.post(f"{base_url}/reset_prefix_cache", params=params)
+            result["status_code"] = resp.status_code
+            try:
+                body: Any = resp.json()
+            except ValueError:
+                body = resp.text[:2048]
+            result["body"] = body
             resp.raise_for_status()
+            explicit_failure = body is False or (
+                isinstance(body, dict)
+                and (
+                    body.get("success") is False
+                    or body.get("reset") is False
+                    or str(body.get("status", "")).lower() in {"failed", "failure", "error"}
+                )
+            )
+            if explicit_failure:
+                raise RuntimeError(f"backend reported reset failure: {body!r}")
         except Exception as e:
             logger.error("reset_prefix_cache failed for %s: %s", base_url, e)
             failures.append(base_url)
+            result["error"] = repr(e)
+        finally:
+            result["elapsed_seconds"] = time.monotonic() - started
+            backends.append(result)
     if failures:
-        return JSONResponse(status_code=500, content={"failed": failures})
-    return Response(status_code=200)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "failed": failures, "backends": backends},
+        )
+    return JSONResponse(status_code=200, content={"success": True, "backends": backends})
 
 
 @app.get("/healthcheck")

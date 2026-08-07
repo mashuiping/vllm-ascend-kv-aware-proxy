@@ -164,8 +164,11 @@ The recommended harness creates a temporary benchmark Pod in the model
 namespace. The Pod talks directly to the Prefiller tokenizer and proxy Services,
 so no port-forward is required. It generates one immutable, exact-token
 workload for all three groups, performs system warm-up, resets backend prefix
-caches, records cache-fill separately and then measures warm turns or QPS
-stages. See [benchmarks/README.md](benchmarks/README.md) for workload details.
+caches, verifies all four Prefillers are cold with direct probes, records
+cache-fill separately and then measures warm turns or QPS stages. Pod mode also
+captures every 4P4D metrics endpoint and marks comparisons invalid when reset
+or isolation checks fail. See [benchmarks/README.md](benchmarks/README.md) for
+workload details.
 
 ```bash
 export PREFILL_NODE='your-prefill-node'
@@ -178,7 +181,9 @@ bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 The completed workload, manifest, group results and comparison are copied from
 the Pod to `results/runs/`. Set `KEEP_BENCHMARK_POD=true` to retain the Pod for
 debugging. The old port-forward workflow remains available with
-`BENCHMARK_EXECUTION_MODE=local` plus `BASE_URL` and `TOKENIZER_URL`.
+`BENCHMARK_EXECUTION_MODE=local` plus `BASE_URL` and `TOKENIZER_URL`, but it
+does not automatically verify all four Prefillers and is marked diagnostic
+only.
 
 For shared-prefix capacity and QPS-ladder testing, use
 `benchmarks/profiles/shared-prefix-capacity.json`.

@@ -25,6 +25,10 @@ def write_group(root: Path, group: str, workload_hash: str, ttft: float) -> None
         ),
         encoding="utf-8",
     )
+    (directory / "validity.json").write_text(
+        json.dumps({"valid": True, "checks": {"reset_verified": True}}),
+        encoding="utf-8",
+    )
 
 
 def test_build_comparison_uses_candidate_off_as_affinity_baseline(tmp_path: Path):
@@ -35,6 +39,7 @@ def test_build_comparison_uses_candidate_off_as_affinity_baseline(tmp_path: Path
     comparison = build_comparison(tmp_path)
 
     assert comparison["workload_sha256"] == "same-hash"
+    assert comparison["valid"] is True
     assert comparison["B_vs_C"]["warm_turns.ttft_ms.p50"]["improvement"] == pytest.approx(0.5)
     assert comparison["A_vs_B"]["warm_turns.ttft_ms.p50"]["improvement"] == pytest.approx(0.2)
 
@@ -46,3 +51,17 @@ def test_build_comparison_rejects_different_workloads(tmp_path: Path):
 
     with pytest.raises(ValueError, match="SHA-256"):
         build_comparison(tmp_path)
+
+
+def test_build_comparison_marks_failed_group_invalid(tmp_path: Path):
+    for group in ("baseline", "candidate-off", "candidate-on"):
+        write_group(tmp_path, group, "same-hash", 100)
+    (tmp_path / "candidate-off" / "validity.json").write_text(
+        json.dumps({"valid": False, "checks": {"reset_verified": False}}),
+        encoding="utf-8",
+    )
+
+    comparison = build_comparison(tmp_path)
+
+    assert comparison["valid"] is False
+    assert comparison["validity"]["groups"]["candidate-off"]["checks"]["reset_verified"] is False

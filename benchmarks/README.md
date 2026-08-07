@@ -135,7 +135,10 @@ Every run executes these phases in order:
 
 ```text
 system warm-up (excluded)
-  -> reset backend prefix caches and candidate affinity LRUs
+  -> wait until all four Prefillers are idle
+  -> prime and verify one isolated cache probe on every Prefiller
+  -> reset through the proxy and verify every direct Prefiller is cold
+  -> final reset removes the verification probes
   -> before metrics snapshot
   -> cache-fill
   -> after-cache-fill metrics snapshot
@@ -145,10 +148,26 @@ system warm-up (excluded)
 
 The Kubernetes A/B/C orchestrator uses eight sacrificial system warm-up
 requests for every group. These requests exercise the HTTP path and model
-runtime, but are not included in the workload summary. It then calls the
-proxy's reset endpoint before taking the measurement snapshots, clearing the
-backend prefix caches and candidate affinity LRUs so that each group starts
-its measured `cache-fill` phase from the same logical state.
+runtime, but are not included in the workload summary. It then waits for all
+four Prefillers to report zero running and waiting requests. Every Prefiller is
+primed directly with an isolated prompt, the second request must report cached
+tokens, a proxy fan-out reset is issued, and the next direct request must report
+zero or omitted cached tokens. A final reset removes those probes before metric
+snapshots and the measured workload. Any missing backend, reset failure, drain
+timeout, or post-reset cache hit aborts the group instead of producing a
+comparison from contaminated state.
+
+The default failure action is to abort without restarting the model. For an
+explicit slow fallback, set `RESET_FAILURE_ACTION=restart`; the orchestrator
+then restarts the Prefill StatefulSet and retries that group once, but only
+when `reset-validation.json` shows that reset verification was the failure.
+
+The raw request JSONL preserves an omitted `cached_tokens` value as `null`.
+For aggregate metrics it is treated as a cache miss (`0`), matching the vLLM
+behavior observed with prompt-token details enabled. Consequently,
+`cached_token_request_rate` uses every successful request in its denominator,
+`cached_token_ratio` uses every prompt token, and `client_computed_tokens`
+includes cold requests.
 
 For `session-long`, turn 0 is `cache-fill` and later turns are `measure`. The
 assistant messages in later turns are fixed in the workload instead of copying
@@ -277,10 +296,16 @@ candidate-off  = candidate proxy, KV-aware=false
 candidate-on   = candidate proxy, KV-aware=true
 ```
 
-For every group it sends eight infrastructure warm-up requests, resets backend
-prefix caches and candidate affinity LRUs, runs the workload, samples optional
-metrics, and then proceeds to the next group. The workload itself is never
-regenerated between groups.
+For every group it sends eight infrastructure warm-up requests, drains all
+Prefillers, verifies the proxy fan-out reset against four direct cache probes,
+runs the workload, and then proceeds to the next group. The workload itself is
+never regenerated between groups.
+
+Pod mode automatically supplies the four stable Prefill roots and all eight
+4P4D `/metrics` endpoints. Each group writes `reset-validation.json`,
+`reset-probe-requests.jsonl`, and `validity.json`. `comparison.json` and the
+HTML report are valid for performance claims only when all three group validity
+checks pass.
 
 For the shared-prefix/QPS experiment, run:
 
@@ -293,19 +318,14 @@ bash scripts/run_abc_experiment.sh \
 
 ### 5. Add metrics sampling when needed
 
-> All metrics URLs passed to Pod mode should use in-cluster DNS names:
+Pod mode already samples all four Prefill and four Decode endpoints. Additional
+debugging endpoints passed manually should use in-cluster DNS names, for
+example:
 
 ```bash
 bash scripts/run_abc_experiment.sh \
   benchmarks/profiles/session-affinity.json \
-  --prefill-metrics-url http://pd-prefill-0.pd-prefill:7100/metrics \
-  --prefill-metrics-url http://pd-prefill-1.pd-prefill:7100/metrics \
-  --prefill-metrics-url http://pd-prefill-2.pd-prefill:7100/metrics \
-  --prefill-metrics-url http://pd-prefill-3.pd-prefill:7100/metrics \
-  --decode-metrics-url http://pd-decode-0.pd-decode:7200/metrics \
-  --decode-metrics-url http://pd-decode-1.pd-decode:7200/metrics \
-  --decode-metrics-url http://pd-decode-2.pd-decode:7200/metrics \
-  --decode-metrics-url http://pd-decode-3.pd-decode:7200/metrics
+  --metrics-url http://some-extra-endpoint:9000/metrics
 ```
 
 
@@ -325,6 +345,14 @@ Each run is copied to a unique directory under `results/runs/`:
   report.html
 ```
 
+Each group directory also contains:
+
+```text
+reset-validation.json       # four-node fan-out and cold-probe evidence
+reset-probe-requests.jsonl  # per-Prefiller prime/hit/miss observations
+validity.json               # required checks and final valid flag
+```
+
 Check the token verification and comparison summary:
 
 ```bash
@@ -335,8 +363,10 @@ open results/runs/<timestamp>-abc/report.html  # macOS; open the file directly e
 
 The manifest must contain `"token_count_verified": true`. Comparison also
 checks that all three group `config.json` files contain the same workload
-SHA-256. The harness packs `/results` into a gzip archive inside the Benchmark Pod,
-copies that archive locally, extracts it, then generates `report.html`.
+SHA-256 and embeds each group validity result. `comparison.json.valid` must be
+`true`; otherwise the HTML report treats improvements as diagnostic only. The
+harness packs `/results` into a gzip archive inside the Benchmark Pod, copies
+that archive locally, extracts it, then generates `report.html`.
 To render a report manually from an existing result directory:
 
 ```bash
@@ -399,6 +429,12 @@ TOKENIZER_URL=http://127.0.0.1:7100 \
 MODEL=qwen3-32b PREFILL_NODE=<node> \
   bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
+
+Local mode does not know the stable address of every Prefiller and therefore
+cannot perform the four-node reset verification automatically. Its
+`validity.json` and final comparison are intentionally marked invalid; use this
+path for debugging only, not for performance claims. Use Pod mode for a valid
+4P4D A/B/C comparison.
 
 The workload design follows the public multi-turn shape described by Higress
 and the shared-prefix, cache-capacity and staged-load methodology published by

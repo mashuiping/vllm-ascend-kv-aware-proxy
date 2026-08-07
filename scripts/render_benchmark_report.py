@@ -121,14 +121,14 @@ def metric_definition(path: str) -> tuple[str, str, str]:
     return path, "", "higher"
 
 
-def metric_rows(comparison: dict[str, Any]) -> list[str]:
+def metric_rows(comparison: dict[str, Any], experiment_valid: bool = True) -> list[str]:
     rows: list[str] = []
     for path, value in sorted(comparison.items()):
         if not isinstance(value, dict):
             continue
         label, unit, _direction = metric_definition(path)
         improvement = number(value.get("improvement"))
-        if improvement is None:
+        if not experiment_valid or improvement is None:
             status = "neutral"
         elif improvement > 0.005:
             status = "positive"
@@ -202,6 +202,7 @@ def render(experiment_dir: Path, output: Path) -> None:
     manifest = load_json(manifest_path) if manifest_path.is_file() else {}
     workload_hash = comparison.get("workload_sha256", "—")
     verified = manifest.get("token_count_verified")
+    experiment_valid = comparison.get("valid") is True
     cards = "".join(summary_card(group, summaries[group]) for group in GROUPS)
     comparison_sections = []
     for key, title in COMPARISONS:
@@ -210,13 +211,21 @@ def render(experiment_dir: Path, output: Path) -> None:
             f"<section><h2>{html.escape(title)}</h2>"
             "<table><thead><tr><th>Metric</th><th>Baseline</th><th>Treatment</th>"
             "<th>Relative change</th><th>Improvement</th></tr></thead><tbody>"
-            + "".join(metric_rows(pair))
+            + "".join(metric_rows(pair, experiment_valid))
             + "</tbody></table></section>"
         )
     raw_links = []
     for group in GROUPS:
         raw_links.append(f'<a href="{html.escape(group)}/summary.json">{html.escape(GROUP_LABELS[group])} summary</a>')
         raw_links.append(f'<a href="{html.escape(group)}/config.json">{html.escape(GROUP_LABELS[group])} config</a>')
+        if (experiment_dir / group / "validity.json").is_file():
+            raw_links.append(
+                f'<a href="{html.escape(group)}/validity.json">{html.escape(GROUP_LABELS[group])} validity</a>'
+            )
+        if (experiment_dir / group / "reset-validation.json").is_file():
+            raw_links.append(
+                f'<a href="{html.escape(group)}/reset-validation.json">{html.escape(GROUP_LABELS[group])} reset</a>'
+            )
     raw_links.extend(
         [
             '<a href="comparison.json">comparison.json</a>',
@@ -225,6 +234,14 @@ def render(experiment_dir: Path, output: Path) -> None:
         ]
     )
     verification_class = "positive" if verified is True else "negative"
+    validity_message = (
+        "Experiment validity checks passed."
+        if experiment_valid
+        else (
+            "Experiment is invalid: improvements are shown for diagnosis only "
+            "and must not be used as performance claims."
+        )
+    )
     page = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -260,6 +277,9 @@ th:first-child,td:first-child {{ text-align:left; }} tr:last-child td {{ border-
 .metric-path {{ display:block; font-size:11px; word-break:break-all; }}
 .positive {{ color:var(--good); font-weight:700; }} .negative {{ color:var(--bad); font-weight:700; }}
 .neutral {{ color:var(--muted); }}
+.validity-banner {{ margin:16px 0; padding:14px 18px; border-radius:10px; font-weight:650; }}
+.validity-banner.valid {{ color:var(--good); background:#ecfdf3; border:1px solid #abefc6; }}
+.validity-banner.invalid {{ color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }}
 .links {{ display:flex; gap:10px 18px; flex-wrap:wrap; }} a {{ color:var(--accent); }}
 @media(max-width:800px) {{ main {{ padding:16px; }} .cards {{ grid-template-columns:1fr; }} }}
 </style>
@@ -267,11 +287,15 @@ th:first-child,td:first-child {{ text-align:left; }} tr:last-child td {{ border-
 <body><main>
 <h1>Benchmark report</h1>
 <div class="subtitle">{html.escape(experiment_dir.name)}</div>
+<div class="validity-banner {'valid' if experiment_valid else 'invalid'}">
+{validity_message}
+</div>
 <div class="meta">
 <div><strong>Workload SHA-256</strong><code>{html.escape(str(workload_hash))}</code></div>
 <div><strong>Token count verified</strong><span class="{verification_class}">{html.escape(str(verified))}</span></div>
 <div><strong>Scenario</strong><span>{html.escape(str(manifest.get("scenario", "—")))}</span></div>
 <div><strong>Requests</strong><span>{html.escape(str(manifest.get("requests", "—")))}</span></div>
+<div><strong>Validity</strong><span>{html.escape(str(experiment_valid))}</span></div>
 </div>
 <h2>Group overview</h2><div class="cards">{cards}</div>
 <section><h2>Phase overview</h2>

@@ -31,7 +31,16 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
     workload_hashes = {value for value in raw_hashes if isinstance(value, str) and value}
     if len(workload_hashes) != 1 or len(workload_hashes) != len(set(raw_hashes)):
         raise ValueError(f"A/B/C workload SHA-256 values differ or are missing: {workload_hashes}")
+    group_validity: dict[str, dict[str, Any]] = {}
+    for group in GROUPS:
+        path = experiment_dir / group / "validity.json"
+        group_validity[group] = (
+            load_json(path) if path.is_file() else {"valid": False, "checks": {"validity_artifact_present": False}}
+        )
+    valid = all(value.get("valid") is True for value in group_validity.values())
     return {
+        "valid": valid,
+        "validity": {"groups": group_validity},
         "workload_sha256": workload_hashes.pop(),
         "A_vs_B": compare_summaries(summaries["baseline"], summaries["candidate-off"]),
         "B_vs_C": compare_summaries(summaries["candidate-off"], summaries["candidate-on"]),

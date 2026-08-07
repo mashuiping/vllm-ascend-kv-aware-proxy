@@ -35,6 +35,7 @@ import statistics
 import sys
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -123,22 +124,19 @@ def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
     ttfb = [result.ttfb_ms for result in successful if result.ttfb_ms is not None]
     e2e = [result.e2e_ms for result in successful]
     prompt_tokens = [float(result.prompt_tokens) for result in successful if result.prompt_tokens is not None]
-    cached_tokens = [
-        float(result.client_cached_tokens) for result in successful if result.client_cached_tokens is not None
-    ]
-    cache_pairs = [
-        (float(result.client_cached_tokens), float(result.prompt_tokens))
-        for result in successful
-        if result.client_cached_tokens is not None and result.prompt_tokens is not None
-    ]
+    # vLLM omits prompt_tokens_details.cached_tokens on a cache miss in the
+    # deployment used by this benchmark. Preserve that distinction in the raw
+    # JSONL, but normalize the missing value to zero for aggregate cache
+    # metrics. Excluding it would make the denominator contain hits only and
+    # report cached_token_request_rate=1.0 whenever any request hit.
+    cache_eligible = [result for result in successful if result.prompt_tokens is not None]
+    cached_tokens = [float(result.client_cached_tokens or 0) for result in cache_eligible]
+    cached_tokens_field_count = sum(result.client_cached_tokens is not None for result in cache_eligible)
+    cache_pairs = [(float(result.client_cached_tokens or 0), float(result.prompt_tokens)) for result in cache_eligible]
     completion_tokens = [
         float(result.completion_tokens) for result in successful if result.completion_tokens is not None
     ]
-    computed_tokens = [
-        float(result.prompt_tokens - result.client_cached_tokens)
-        for result in successful
-        if result.prompt_tokens is not None and result.client_cached_tokens is not None
-    ]
+    computed_tokens = [float(result.prompt_tokens - (result.client_cached_tokens or 0)) for result in cache_eligible]
     started_at = [result.started_at_s for result in successful]
     ended_at = [result.ended_at_s for result in successful]
     window_seconds = max(ended_at) - min(started_at) if started_at and ended_at else 0.0
@@ -166,6 +164,7 @@ def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
         "client_cached_tokens": describe(cached_tokens),
         "client_computed_tokens": describe(computed_tokens),
         "completion_tokens": describe(completion_tokens),
+        "cached_tokens_field_rate": (cached_tokens_field_count / len(cache_eligible) if cache_eligible else None),
         "cached_token_request_rate": (
             sum(value > 0 for value in cached_tokens) / len(cached_tokens) if cached_tokens else None
         ),
@@ -624,10 +623,203 @@ def derive_urls(base_url: str) -> tuple[str, str]:
     return api_url, urljoin(root, "healthcheck")
 
 
-def reset_cache(url: str, api_key: str | None, timeout: float, verify: bool) -> None:
+def reset_cache(url: str, api_key: str | None, timeout: float, verify: bool) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     response = requests.post(url, headers=headers, timeout=timeout, verify=verify)
     response.raise_for_status()
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = response.text[:2048]
+    return {"url": url, "status_code": response.status_code, "body": body}
+
+
+def validate_reset_fanout(reset_result: dict[str, Any], base_urls: list[str]) -> None:
+    body = reset_result.get("body")
+    if not isinstance(body, dict) or body.get("success") is not True:
+        raise RuntimeError(f"proxy reset did not return a successful structured result: {body!r}")
+    backends = body.get("backends")
+    if not isinstance(backends, list) or len(backends) != len(base_urls):
+        raise RuntimeError(
+            f"proxy reset reported {len(backends) if isinstance(backends, list) else 0} backends; "
+            f"expected {len(base_urls)}: {body!r}"
+        )
+    expected = {base_url.rstrip("/") for base_url in base_urls}
+    reported = {
+        str(backend.get("target", "")).rstrip("/")
+        for backend in backends
+        if isinstance(backend, dict) and not backend.get("error")
+    }
+    if reported != expected:
+        raise RuntimeError(f"proxy reset targets differ: expected {sorted(expected)}, got {sorted(reported)}")
+
+
+def metrics_url(base_url: str) -> str:
+    return urljoin(base_url.rstrip("/") + "/", "metrics")
+
+
+def chat_completions_url(base_url: str) -> str:
+    return urljoin(base_url.rstrip("/") + "/", "v1/chat/completions")
+
+
+def wait_for_prefills_idle(
+    base_urls: list[str],
+    timeout: float,
+    verify: bool,
+    poll_interval: float = 0.25,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    last: dict[str, dict[str, float]] = {}
+    while True:
+        idle = True
+        current: dict[str, dict[str, float]] = {}
+        for base_url in base_urls:
+            response = requests.get(metrics_url(base_url), timeout=min(timeout, 30.0), verify=verify)
+            response.raise_for_status()
+            parsed = parse_prometheus(response.text)
+            missing = {
+                name for name in ("vllm:num_requests_running", "vllm:num_requests_waiting") if name not in parsed
+            }
+            if missing:
+                raise RuntimeError(f"Prefill metrics from {base_url} are missing {sorted(missing)}")
+            running = parsed.get("vllm:num_requests_running", 0.0)
+            waiting = parsed.get("vllm:num_requests_waiting", 0.0)
+            current[base_url] = {"running": running, "waiting": waiting}
+            idle = idle and running <= 0 and waiting <= 0
+        last = current
+        if idle:
+            return {"wait_seconds": time.monotonic() - started, "backends": last}
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError(f"Prefill drain timed out after {timeout}s: {last}")
+        time.sleep(poll_interval)
+
+
+def send_reset_probe(
+    base_url: str,
+    model: str,
+    prompt: str,
+    api_key: str | None,
+    timeout: float,
+    verify: bool,
+) -> dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    started = time.monotonic()
+    response = requests.post(
+        chat_completions_url(base_url),
+        headers=headers,
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "max_tokens": 1,
+            "temperature": 0.0,
+        },
+        timeout=(30.0, timeout),
+        verify=verify,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    cached_tokens = details.get("cached_tokens")
+    return {
+        "base_url": base_url,
+        "status_code": response.status_code,
+        "elapsed_seconds": time.monotonic() - started,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "cached_tokens": cached_tokens if isinstance(cached_tokens, int) else None,
+    }
+
+
+def verify_reset_across_prefills(
+    *,
+    base_urls: list[str],
+    reset_url: str,
+    model: str,
+    label: str,
+    api_key: str | None,
+    timeout: float,
+    drain_timeout: float,
+    verify: bool,
+    output_dir: Path,
+) -> dict[str, Any]:
+    validation: dict[str, Any] = {
+        "verified": False,
+        "prefill_count": len(base_urls),
+        "prefill_base_urls": base_urls,
+        "drains": [],
+        "probes": [],
+        "resets": [],
+    }
+    probe_path = output_dir / "reset-probe-requests.jsonl"
+    probe_writer = JsonlWriter(probe_path)
+    probe_nonce = uuid.uuid4().hex
+
+    def record_probe(phase: str, index: int, base_url: str, prompt: str) -> dict[str, Any]:
+        result = send_reset_probe(base_url, model, prompt, api_key, timeout, verify)
+        result.update({"phase": phase, "prefill_index": index})
+        validation["probes"].append(result)
+        probe_writer.write(result)
+        return result
+
+    try:
+        validation["drains"].append(
+            {"phase": "before-prime", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
+        )
+        prompts = [
+            (
+                f"reset-verification-{probe_nonce}-{label}-{index}\n"
+                + " ".join(f"resetprobe{index:02d}word{word:04d}" for word in range(384))
+            )
+            for index in range(len(base_urls))
+        ]
+        for index, (base_url, prompt) in enumerate(zip(base_urls, prompts, strict=True)):
+            first = record_probe("prime-miss", index, base_url, prompt)
+            if not isinstance(first.get("prompt_tokens"), int) or first["prompt_tokens"] <= 128:
+                raise RuntimeError(f"reset probe for {base_url} did not exceed one 128-token cache block: {first}")
+            second = record_probe("prime-hit", index, base_url, prompt)
+            if not isinstance(second.get("cached_tokens"), int) or second["cached_tokens"] <= 0:
+                raise RuntimeError(f"reset probe did not establish a cache hit on {base_url}: {second}")
+
+        validation["drains"].append(
+            {"phase": "before-verified-reset", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
+        )
+        verified_reset = reset_cache(reset_url, api_key, timeout, verify)
+        validation["resets"].append({"phase": "verified-reset", **verified_reset})
+        validate_reset_fanout(verified_reset, base_urls)
+        validation["drains"].append(
+            {"phase": "after-verified-reset", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
+        )
+
+        for index, (base_url, prompt) in enumerate(zip(base_urls, prompts, strict=True)):
+            cold = record_probe("post-reset-miss", index, base_url, prompt)
+            if cold.get("cached_tokens") not in (None, 0):
+                raise RuntimeError(f"reset verification still hit cached tokens on {base_url}: {cold}")
+
+        validation["drains"].append(
+            {"phase": "before-final-reset", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
+        )
+        final_reset = reset_cache(reset_url, api_key, timeout, verify)
+        validation["resets"].append({"phase": "final-reset", **final_reset})
+        validate_reset_fanout(final_reset, base_urls)
+        validation["drains"].append(
+            {"phase": "after-final-reset", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
+        )
+        validation["verified"] = True
+        return validation
+    except Exception as exc:
+        validation["error"] = repr(exc)
+        raise
+    finally:
+        probe_writer.close()
+        (output_dir / "reset-validation.json").write_text(
+            json.dumps(validation, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
 
 def summarize_health_samples(
@@ -785,6 +977,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefill-metrics-url", action="append", default=[])
     parser.add_argument("--decode-metrics-url", action="append", default=[])
     parser.add_argument(
+        "--prefill-base-url",
+        action="append",
+        default=[],
+        help="Direct Prefill root used to drain and verify reset; repeat once per Prefill.",
+    )
+    parser.add_argument(
         "--metrics-url",
         action="append",
         default=[],
@@ -792,6 +990,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reset-before", action="store_true")
     parser.add_argument("--reset-url", help="Proxy reset endpoint; derived by default.")
+    parser.add_argument(
+        "--verify-reset",
+        action="store_true",
+        help="Prime, reset, and probe every --prefill-base-url before measurement.",
+    )
+    parser.add_argument("--expected-prefill-count", type=int, default=0)
+    parser.add_argument("--reset-drain-timeout", type=float, default=120.0)
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
     parser.add_argument("--seed", type=int, default=20260724)
     parser.add_argument(
@@ -807,10 +1012,22 @@ def parse_args() -> argparse.Namespace:
         help="Existing baseline summary.json; writes comparison.json for this run.",
     )
     args = parser.parse_args()
+    for name in ("prefill_base_url", "prefill_metrics_url", "decode_metrics_url", "metrics_url"):
+        setattr(args, name, list(dict.fromkeys(getattr(args, name))))
     if args.sessions <= 0 or args.turns <= 0 or args.concurrency <= 0:
         parser.error("sessions, turns, and concurrency must be positive")
     if args.system_warmup_requests < 0:
         parser.error("system-warmup-requests must be non-negative")
+    if args.expected_prefill_count < 0:
+        parser.error("expected-prefill-count must be non-negative")
+    if args.reset_drain_timeout <= 0:
+        parser.error("reset-drain-timeout must be positive")
+    if args.verify_reset and not args.reset_before:
+        parser.error("--verify-reset requires --reset-before")
+    if args.verify_reset and not args.prefill_base_url:
+        parser.error("--verify-reset requires at least one --prefill-base-url")
+    if args.expected_prefill_count and len(args.prefill_base_url) != args.expected_prefill_count:
+        parser.error(f"expected {args.expected_prefill_count} Prefill URLs, got {len(args.prefill_base_url)}")
     if args.scenario == "one-shot":
         args.turns = 1
     return args
@@ -979,9 +1196,32 @@ def main() -> int:
     # Infrastructure warm-up deliberately happens before this reset. The
     # measured cache-fill phase therefore starts with empty backend KV and,
     # for the candidate, empty routing-affinity LRUs.
-    if args.reset_before:
+    reset_validation: dict[str, Any] | None = None
+    if args.reset_before and args.verify_reset:
+        print(
+            f"[benchmark] verifying reset across {len(args.prefill_base_url)} Prefill backends",
+            file=sys.stderr,
+            flush=True,
+        )
+        reset_validation = verify_reset_across_prefills(
+            base_urls=args.prefill_base_url,
+            reset_url=reset_url,
+            model=args.model,
+            label=args.label,
+            api_key=api_key,
+            timeout=args.timeout,
+            drain_timeout=args.reset_drain_timeout,
+            verify=verify,
+            output_dir=output_dir,
+        )
+    elif args.reset_before:
         print("[benchmark] resetting backend prefix/affinity caches", file=sys.stderr, flush=True)
-        reset_cache(reset_url, api_key, args.timeout, verify)
+        reset_result = reset_cache(reset_url, api_key, args.timeout, verify)
+        reset_validation = {"verified": False, "resets": [{"phase": "unverified-reset", **reset_result}]}
+        (output_dir / "reset-validation.json").write_text(
+            json.dumps(reset_validation, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     requests_writer = JsonlWriter(output_dir / "requests.jsonl")
     samples_writer = JsonlWriter(samples_path)
@@ -1230,6 +1470,32 @@ def main() -> int:
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    required_checks = {
+        "requests_succeeded": summary["overall"]["errors"] == 0,
+        "reset_verified": bool(reset_validation and reset_validation.get("verified")),
+        "prefill_count_matches": (
+            not args.expected_prefill_count or len(args.prefill_base_url) == args.expected_prefill_count
+        ),
+        "prefill_metrics_complete": (
+            not args.prefill_metrics_url
+            or all(url in sampler.before and url in sampler.after for url in args.prefill_metrics_url)
+        ),
+        "decode_metrics_complete": (
+            not args.decode_metrics_url
+            or all(url in sampler.before and url in sampler.after for url in args.decode_metrics_url)
+        ),
+    }
+    if scenario == "session-long" and args.reset_before:
+        required_checks["cold_turn_has_no_cache_hits"] = summary["cold_turn"]["cached_token_request_rate"] == 0
+    validity = {
+        "valid": all(required_checks.values()),
+        "checks": required_checks,
+        "reset_validation_file": "reset-validation.json" if reset_validation is not None else None,
+    }
+    (output_dir / "validity.json").write_text(
+        json.dumps(validity, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     if args.compare_with:

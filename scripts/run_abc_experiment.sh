@@ -18,6 +18,15 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 EXECUTION_MODE="${BENCHMARK_EXECUTION_MODE:-pod}"
 NAMESPACE="${NAMESPACE:-qwen-pd}"
 VLLM_IMAGE="${VLLM_IMAGE:-quay.io/ascend/vllm-ascend:v0.18.0}"
+RESET_FAILURE_ACTION="${RESET_FAILURE_ACTION:-abort}"
+
+case "${RESET_FAILURE_ACTION}" in
+  abort|restart) ;;
+  *)
+    echo "RESET_FAILURE_ACTION must be abort or restart" >&2
+    exit 2
+    ;;
+esac
 
 if [[ ! -f "${PROFILE}" ]]; then
   echo "workload profile not found: ${PROFILE}" >&2
@@ -129,6 +138,15 @@ run_in_pod() {
   local tokenizer_url="${IN_CLUSTER_TOKENIZER_URL:-http://pd-prefill-0.pd-prefill:7100}"
   local base_url="${IN_CLUSTER_BASE_URL:-http://pd-proxy:8000}"
   local benchmark_manifest="${DEPLOY_DIR}/benchmark-pod.yaml"
+  local -a backend_args=()
+  local index
+  for index in 0 1 2 3; do
+    backend_args+=(
+      --prefill-base-url "http://pd-prefill-${index}.pd-prefill:7100"
+      --prefill-metrics-url "http://pd-prefill-${index}.pd-prefill:7100/metrics"
+      --decode-metrics-url "http://pd-decode-${index}.pd-decode:7200/metrics"
+    )
+  done
 
   on_exit() {
     local status=$?
@@ -183,17 +201,35 @@ run_in_pod() {
   for group in "${groups[@]}"; do
     deploy_proxy_group "${group}"
     log "${group}: proxy ready; benchmark pod is starting workload"
-    kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
-      python /opt/benchmark/benchmark_session_affinity.py \
-        --base-url "${base_url}" \
-        --model "${MODEL}" \
-        --workload-file "${workload_file}" \
-        --output-dir "/results/${group}" \
-        --concurrency "${concurrency}" \
-        --system-warmup-requests "${SYSTEM_WARMUP_REQUESTS:-8}" \
-        --label "${group}" \
-        --reset-before \
-        "$@"
+    local -a benchmark_command=(
+      python /opt/benchmark/benchmark_session_affinity.py
+      --base-url "${base_url}"
+      --model "${MODEL}"
+      --workload-file "${workload_file}"
+      --output-dir "/results/${group}"
+      --concurrency "${concurrency}"
+      --system-warmup-requests "${SYSTEM_WARMUP_REQUESTS:-8}"
+      --label "${group}"
+      --reset-before
+      --verify-reset
+      --expected-prefill-count 4
+      --reset-drain-timeout "${RESET_DRAIN_TIMEOUT:-120}"
+      "${backend_args[@]}"
+      "$@"
+    )
+    if ! kubectl -n "${NAMESPACE}" exec "${pod_name}" -- "${benchmark_command[@]}"; then
+      if [[ "${RESET_FAILURE_ACTION}" != "restart" ]] || ! kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+        python -c 'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); sys.exit(0 if p.is_file() and not json.loads(p.read_text()).get("verified") else 1)' \
+        "/results/${group}/reset-validation.json"; then
+        return 1
+      fi
+      log "${group}: reset verification failed; restarting Prefill StatefulSet by request"
+      kubectl -n "${NAMESPACE}" rollout restart statefulset/pd-prefill
+      kubectl -n "${NAMESPACE}" rollout status statefulset/pd-prefill --timeout=60m
+      deploy_proxy_group "${group}"
+      log "${group}: Prefillers restarted; retrying benchmark once"
+      kubectl -n "${NAMESPACE}" exec "${pod_name}" -- "${benchmark_command[@]}"
+    fi
     log "completed group=${group}"
   done
 

@@ -17,8 +17,9 @@ A versus C only as the end-to-end comparison with stock upstream.
 ## Control variables
 
 - Keep P/D Pods, model, image, scheduler arguments and hardware unchanged.
-- Restart only the proxy between groups.
-- Reset backend prefix caches before every measured run.
+- Restart only the proxy between groups by default.
+- Drain all Prefillers, reset backend prefix caches and verify every direct
+  Prefiller is cold before every measured run.
 - Use identical prompts, seeds, session IDs and concurrency.
 - Alternate group order across repetitions instead of always running A/B/C.
 - Record warm-up separately from measured requests.
@@ -28,7 +29,7 @@ A versus C only as the end-to-end comparison with stock upstream.
 
 At minimum, record the image digest, model identifier, NPU type, CANN and driver
 versions, P/D topology, repository commit, upstream baseline commit, run order,
-benchmark command and reset outcome.
+benchmark command, per-Prefiller reset outcome and experiment validity result.
 
 ## Required workloads
 
@@ -62,6 +63,11 @@ cache-fill phases, Poisson QPS stages and capacity sizing.
 - per-Prefiller cache/query/load distribution;
 - NPU memory pressure where available.
 
+The controlled deployment enables prompt-token details. A missing
+`cached_tokens` field is retained as `null` in raw JSONL but normalized to zero
+for aggregate request-rate, token-ratio and computed-token metrics. Excluding
+missing values would calculate cache ratios over hits only.
+
 An affinity hit is not itself proof of value. The desired chain is:
 
 ```text
@@ -73,18 +79,22 @@ and proxy overhead before widening affinity.
 
 ## Running
 
-The benchmark writes request JSONL, configuration, metric snapshots and a
-summary under the selected output directory. The helper maps each experiment
-group onto deployment variables:
+The benchmark writes request JSONL, configuration, metric snapshots, reset
+verification, validity and a summary under the selected output directory. The
+helper maps each experiment group onto deployment variables. Comparison output
+is marked invalid unless all group checks pass.
 
 For a production comparison, generate one workload and run the complete matrix:
 
 ```bash
-BASE_URL=http://127.0.0.1:8000 \
-TOKENIZER_URL=http://PREFILLER:7100 \
 MODEL=qwen3-32b PREFILL_NODE=<node> \
   bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
+
+This defaults to the in-cluster Benchmark Pod and verifies every Prefiller.
+The legacy local/port-forward path cannot discover and probe all four
+Prefillers automatically, so its comparison is marked invalid and should be
+used only for debugging.
 
 The individual commands below remain useful for debugging and legacy generated
 workloads:
