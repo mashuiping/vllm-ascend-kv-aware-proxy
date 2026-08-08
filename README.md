@@ -93,8 +93,8 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 python -m pytest
-python -m ruff check load_balance_proxy_server_example.py scripts tests
-python -m ruff format --check load_balance_proxy_server_example.py scripts tests
+python -m ruff check load_balance_proxy_server_example.py benchmarks tests
+python -m ruff format --check load_balance_proxy_server_example.py benchmarks tests
 ```
 
 The standalone proxy runtime needs FastAPI, HTTPX and Uvicorn. The supplied
@@ -198,55 +198,15 @@ Use the same P/D Pods and change only the proxy group:
 | B: `candidate-off` | `candidate` | `false` | Candidate and restored load accounting without affinity |
 | C: `candidate-on` | `candidate` | `true` | KV-aware session/prefix affinity |
 
-The recommended harness creates a temporary benchmark Pod in the model
-namespace. The Pod talks directly to the Prefiller tokenizer and proxy Services,
-so no port-forward is required. It generates one immutable, exact-token
-workload for all three groups, performs system warm-up, resets backend prefix
-caches, verifies all four Prefillers are cold with direct probes, records
-cache-fill separately and then measures warm turns or QPS stages. Pod mode also
-captures every 4P4D metrics endpoint and marks comparisons invalid when reset
-or isolation checks fail. See [benchmarks/README.md](benchmarks/README.md) for
-workload details. The shared-prefix profile uses one prime and one prefix probe
-per group, then reports each QPS stage separately so the baseline cannot be
-judged only from its later fully-warmed state.
+The complete runbook, workload profiles, reset validation and result handling
+are maintained in [benchmarks/README.md](benchmarks/README.md).
 
 ```bash
 export PREFILL_NODE='your-prefill-node'
 export VLLM_IMAGE='your-tested-vllm-ascend-image'
 export MODEL='qwen3-32b'
 
-bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
-```
-
-The completed workload, manifest, group results and comparison are copied from
-the Pod to `results/runs/`. Set `KEEP_BENCHMARK_POD=true` to retain the Pod for
-debugging. The old port-forward workflow remains available with
-`BENCHMARK_EXECUTION_MODE=local` plus `BASE_URL` and `TOKENIZER_URL`, but it
-does not automatically verify all four Prefillers and is marked diagnostic
-only.
-
-For shared-prefix capacity and QPS-ladder testing, use
-`benchmarks/profiles/shared-prefix-capacity.json`.
-
-`run_experiment.sh` can still run one group. Set `WORKLOAD_FILE` to ensure it
-uses the same frozen data as the other groups:
-
-```bash
-WORKLOAD_FILE=results/runs/<experiment>/workload.jsonl \
-  bash scripts/run_experiment.sh candidate-on
-```
-
-Legacy on-the-fly generation remains available for debugging. Pass additional
-benchmark arguments after the group name, for example:
-
-```bash
-bash scripts/run_experiment.sh candidate-on \
-  --scenario shared-prefix \
-  --sessions 128 \
-  --turns 4 \
-  --concurrency 32 \
-  --prefill-metrics-url http://P0:7100/metrics \
-  --prefill-metrics-url http://P1:7101/metrics
+bash benchmarks/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
 Raw runs go to `results/runs/` and are ignored by Git. Publish only reviewed,

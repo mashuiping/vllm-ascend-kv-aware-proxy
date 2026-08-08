@@ -88,44 +88,10 @@ when the question is an isolated capacity point.
 
 ## Running
 
-The benchmark writes request JSONL, configuration, metric snapshots, reset
-verification, validity and a summary under the selected output directory. The
-helper maps each experiment group onto deployment variables. Comparison output
-is marked invalid unless all group checks pass.
-
-For a production comparison, generate one workload and run the complete matrix:
-
-```bash
-MODEL=qwen3-32b PREFILL_NODE=<node> \
-  bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
-```
-
-This defaults to the in-cluster Benchmark Pod and verifies every Prefiller.
-The legacy local/port-forward path cannot discover and probe all four
-Prefillers automatically, so its comparison is marked invalid and should be
-used only for debugging.
-
-The individual commands below remain useful for debugging and legacy generated
-workloads:
-
-```bash
-BASE_URL=http://127.0.0.1:8000 MODEL=qwen3-32b \
-  bash scripts/run_experiment.sh baseline
-
-BASE_URL=http://127.0.0.1:8000 MODEL=qwen3-32b \
-  bash scripts/run_experiment.sh candidate-off
-
-BASE_URL=http://127.0.0.1:8000 MODEL=qwen3-32b \
-  bash scripts/run_experiment.sh candidate-on
-```
-
-To generate `comparison.json`, point a treatment run at an existing baseline:
-
-```bash
-COMPARE_WITH=results/runs/<baseline>/summary.json \
-BASE_URL=http://127.0.0.1:8000 MODEL=qwen3-32b \
-  bash scripts/run_experiment.sh candidate-on
-```
+The executable runbook lives in [`benchmarks/README.md`](../benchmarks/README.md).
+It documents the Pod and local modes, workload generation, reset validation,
+result artifacts and recovery procedures. A result is publishable only when
+the recorded validity checks pass for every comparison group.
 
 Review and redact artifacts according to [`results/README.md`](../results/README.md)
 before publishing them.

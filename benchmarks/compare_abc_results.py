@@ -10,8 +10,8 @@ from typing import Any
 
 try:
     from benchmark_session_affinity import compare_summaries
-except ModuleNotFoundError:  # Imported as scripts.compare_abc_results in tests.
-    from scripts.benchmark_session_affinity import compare_summaries
+except ModuleNotFoundError:  # Imported as benchmarks.compare_abc_results in tests.
+    from benchmarks.benchmark_session_affinity import compare_summaries
 
 
 GROUPS = ("baseline", "candidate-off", "candidate-on")

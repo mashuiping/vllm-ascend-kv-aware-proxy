@@ -1,6 +1,6 @@
 import json
 
-from scripts.render_benchmark_report import render
+from benchmarks.render_benchmark_report import render
 
 
 def test_render_benchmark_report(tmp_path):

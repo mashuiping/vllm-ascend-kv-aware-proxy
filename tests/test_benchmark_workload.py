@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.benchmark_workload import (
+from benchmarks.benchmark_workload import (
     PlannedRequest,
     TokenTextFactory,
     generate_workload,

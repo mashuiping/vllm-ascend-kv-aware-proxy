@@ -23,8 +23,8 @@ try:
         workload_manifest,
         write_workload_jsonl,
     )
-except ModuleNotFoundError:  # Imported as scripts.generate_benchmark_workload in tests.
-    from scripts.benchmark_workload import (
+except ModuleNotFoundError:  # Imported as benchmarks.generate_benchmark_workload in tests.
+    from benchmarks.benchmark_workload import (
         TokenTextFactory,
         generate_workload,
         load_profile,

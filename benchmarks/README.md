@@ -1,9 +1,12 @@
-# Benchmark workloads
+# Benchmark workloads and tooling
 
 The production benchmark uses one immutable JSONL workload for all A/B/C
 groups. Never generate a separate workload per group: the JSONL file fixes
 session IDs, messages, request order, load-stage offsets, output limits and the
 random seed.
+
+All benchmark generators, runners, comparison tools and report renderers live
+in this directory alongside the checked-in workload profiles.
 
 ## Profiles
 
@@ -21,7 +24,7 @@ characters. Generate them against the exact served model through a direct vLLM
 endpoint exposing `/tokenize` and `/detokenize`:
 
 ```bash
-python scripts/generate_benchmark_workload.py \
+python benchmarks/generate_benchmark_workload.py \
   --profile benchmarks/profiles/session-affinity.json \
   --output results/runs/session-affinity.jsonl \
   --tokenizer-url http://PREFILLER:7100 \
@@ -33,7 +36,7 @@ publishable run. `--allow-unverified-token-counts` exists only for offline smoke
 tests:
 
 ```bash
-python scripts/generate_benchmark_workload.py \
+python benchmarks/generate_benchmark_workload.py \
   --profile benchmarks/profiles/smoke.json \
   --output /tmp/kv-aware-smoke.jsonl \
   --allow-unverified-token-counts
@@ -46,7 +49,7 @@ the shared workload used by all three groups:
 
 ```bash
 SYSTEM_PROMPT_TOKENS=8192 \
-bash scripts/run_abc_experiment.sh \
+bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/session-affinity.json
 ```
 
@@ -129,7 +132,7 @@ profile.
 Run it with the normal orchestrator:
 
 ```bash
-bash scripts/run_abc_experiment.sh \
+bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/load-balance-active-tokens.json
 ```
 
@@ -340,7 +343,7 @@ DNS, tokenizer access, proxy rollout, and result copying:
 
 ```bash
 KEEP_BENCHMARK_POD=true \
-  bash scripts/run_abc_experiment.sh benchmarks/profiles/smoke.json
+  bash benchmarks/run_abc_experiment.sh benchmarks/profiles/smoke.json
 ```
 
 The script checks that the image contains Python `requests` and `tar`. Once a
@@ -359,7 +362,7 @@ cd ../..
 The session-locality profile is the default production starting point:
 
 ```bash
-bash scripts/run_abc_experiment.sh \
+bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/session-affinity.json
 ```
 
@@ -388,7 +391,7 @@ checks pass.
 For the shared-prefix/QPS experiment, run:
 
 ```bash
-bash scripts/run_abc_experiment.sh \
+bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/shared-prefix-capacity.json
 ```
 
@@ -401,7 +404,7 @@ debugging endpoints passed manually should use in-cluster DNS names, for
 example:
 
 ```bash
-bash scripts/run_abc_experiment.sh \
+bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/session-affinity.json \
   --metrics-url http://some-extra-endpoint:9000/metrics
 ```
@@ -448,7 +451,7 @@ that archive locally, extracts it, then generates `report.html`.
 To render a report manually from an existing result directory:
 
 ```bash
-python scripts/render_benchmark_report.py results/runs/<timestamp>-abc
+python benchmarks/render_benchmark_report.py results/runs/<timestamp>-abc
 ```
 
 The self-contained report highlights the A/B/C overview, B → C KV-aware
@@ -490,7 +493,7 @@ Use `GROUP_ORDER` to balance order across repetitions, for example:
 
 ```bash
 GROUP_ORDER='candidate-off candidate-on baseline' \
-  bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
+  bash benchmarks/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
 At least six repetitions should cover the six A/B/C permutations. Treat
@@ -505,7 +508,7 @@ BENCHMARK_EXECUTION_MODE=local \
 BASE_URL=http://127.0.0.1:8000 \
 TOKENIZER_URL=http://127.0.0.1:7100 \
 MODEL=qwen3-32b PREFILL_NODE=<node> \
-  bash scripts/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
+  bash benchmarks/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
 Local mode does not know the stable address of every Prefiller and therefore

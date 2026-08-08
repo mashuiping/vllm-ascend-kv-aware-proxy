@@ -7,7 +7,7 @@ concurrently. Besides per-request latency, the script can sample the proxy
 health endpoint and every P/D vLLM /metrics endpoint.
 
 Example:
-  OPENAI_API_KEY=... python scripts/benchmark_session_affinity.py \
+  OPENAI_API_KEY=... python benchmarks/benchmark_session_affinity.py \
     --base-url http://proxy:9000 \
     --model glm5.1 \
     --scenario session-long \
@@ -46,8 +46,8 @@ from requests.adapters import HTTPAdapter
 
 try:
     from benchmark_workload import PlannedRequest, load_workload_jsonl
-except ModuleNotFoundError:  # Imported as scripts.benchmark_session_affinity in tests.
-    from scripts.benchmark_workload import PlannedRequest, load_workload_jsonl
+except ModuleNotFoundError:  # Imported as benchmarks.benchmark_session_affinity in tests.
+    from benchmarks.benchmark_workload import PlannedRequest, load_workload_jsonl
 
 PROMETHEUS_LINE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>.*)\})?\s+"

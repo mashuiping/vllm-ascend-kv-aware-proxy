@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.compare_abc_results import build_comparison
+from benchmarks.compare_abc_results import build_comparison
 
 
 def write_group(root: Path, group: str, workload_hash: str, ttft: float) -> None:

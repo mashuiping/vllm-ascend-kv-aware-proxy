@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from scripts.benchmark_workload import TokenTextFactory, generate_workload, write_workload_jsonl
+from benchmarks.benchmark_workload import TokenTextFactory, generate_workload, write_workload_jsonl
 
-BENCHMARK_PATH = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_session_affinity.py"
+BENCHMARK_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "benchmark_session_affinity.py"
 SPEC = importlib.util.spec_from_file_location("benchmark_session_affinity", BENCHMARK_PATH)
 assert SPEC is not None and SPEC.loader is not None
 benchmark = importlib.util.module_from_spec(SPEC)

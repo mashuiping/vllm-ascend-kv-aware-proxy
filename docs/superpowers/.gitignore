@@ -1,3 +1,0 @@
-# Keep specs/plans local — only this rule file is tracked.
-*
-!.gitignore
