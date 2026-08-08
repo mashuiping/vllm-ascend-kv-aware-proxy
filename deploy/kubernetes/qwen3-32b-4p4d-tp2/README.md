@@ -67,7 +67,7 @@ Important optional settings:
 
 | Variable | Default |
 | --- | --- |
-| `MAX_MODEL_LEN` | `8192` |
+| `MAX_MODEL_LEN` | `32768` |
 | `PREFILL_MAX_BATCHED_TOKENS` | `4096` |
 | `DECODE_MAX_BATCHED_TOKENS` | `512` |
 | `PREFILL_MAX_NUM_SEQS` | `32` |
@@ -76,6 +76,10 @@ Important optional settings:
 | `SESSION_LRU_SIZE` | `4096` |
 | `PREFIX_HASH_CHARS` | `1024` |
 | `PREFIX_LRU_SIZE` | `1024` |
+
+The default uses Qwen3-32B's native 32K context window and does not require
+RoPE scaling. Prefill remains chunked at 4,096 tokens by default, so longer
+prompts do not require a matching increase in `PREFILL_MAX_BATCHED_TOKENS`.
 
 ## Select an experiment group
 
