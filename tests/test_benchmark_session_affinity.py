@@ -123,6 +123,26 @@ python_gc_objects_collected_total 999
     }
 
 
+def test_summarize_backend_balance_preserves_per_prefiller_distribution():
+    urls = ["http://p0/metrics", "http://p1/metrics"]
+    summary = benchmark.summarize_backend_balance(
+        urls,
+        {
+            urls[0]: {"vllm:request_success": 60.0, "vllm:prompt_tokens": 6000.0},
+            urls[1]: {"vllm:request_success": 40.0, "vllm:prompt_tokens": 4000.0},
+        },
+    )
+
+    assert summary["backends"] == 2
+    assert summary["request_success"]["total"] == 100.0
+    assert summary["request_success"]["spread"] == 20.0
+    assert summary["request_success"]["cv"] == pytest.approx(0.2)
+    assert summary["prompt_tokens"]["by_url"] == {
+        "http://p0/metrics": 6000.0,
+        "http://p1/metrics": 4000.0,
+    }
+
+
 def test_health_summary_can_exclude_cache_fill_samples(tmp_path: Path):
     samples = tmp_path / "samples.jsonl"
     records = [
@@ -134,12 +154,24 @@ def test_health_summary_can_exclude_cache_fill_samples(tmp_path: Path):
         {
             "timestamp": 2.0,
             "kind": "proxy_health",
-            "value": {"prefix_affinity_stats": {"lookups": 100, "hits": 50}},
+            "value": {
+                "prefix_affinity_stats": {"lookups": 100, "hits": 50},
+                "prefill_loads": {
+                    "p0": {"priority": 10, "selections": 20},
+                    "p1": {"priority": 10, "selections": 20},
+                },
+            },
         },
         {
             "timestamp": 3.0,
             "kind": "proxy_health",
-            "value": {"prefix_affinity_stats": {"lookups": 112, "hits": 59}},
+            "value": {
+                "prefix_affinity_stats": {"lookups": 112, "hits": 59},
+                "prefill_loads": {
+                    "p0": {"priority": 12, "selections": 26},
+                    "p1": {"priority": 8, "selections": 24},
+                },
+            },
         },
     ]
     samples.write_text("".join(f"{json.dumps(record)}\n" for record in records))
@@ -149,6 +181,8 @@ def test_health_summary_can_exclude_cache_fill_samples(tmp_path: Path):
     assert summary["prefix_affinity_stats_delta"]["lookups"] == 12
     assert summary["prefix_affinity_stats_delta"]["hits"] == 9
     assert summary["prefix_affinity_stats_delta"]["derived_prefix_hit_rate"] == 0.75
+    assert summary["selection_count_delta"] == {"p0": 6, "p1": 4}
+    assert summary["selection_count_cv"] == pytest.approx(0.2)
 
 
 def test_verify_reset_across_prefills_primes_checks_and_cleans(tmp_path: Path, monkeypatch):

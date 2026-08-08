@@ -15,7 +15,7 @@ in this directory alongside the checked-in workload profiles.
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
-| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, continuous Poisson overlap at 8/16/24 QPS, concurrency 64 | A/B Prefill active-token load balancing |
+| `load-balance-active-tokens.json` | Unique 512/4,096/8,192-token prompt classes, continuous Poisson overlap at 8/16/24/32 QPS, concurrency 128 | A/B Prefill active-token load balancing |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -108,19 +108,23 @@ every request has a unique prompt, session headers are disabled, and the
 primary comparison is Prefill queue time, TTFT tail latency and per-node load
 balance.
 
-The workload cycles through three prompt-size classes (512, 2,048 and 4,096
+The workload cycles through three prompt-size classes (512, 4,096 and 8,192
 system tokens, with correspondingly different user inputs) while requests
 arrive according to deterministic Poisson offsets:
 
 | Stage | Target rate | Duration | Concurrency |
 | ----- | ----------- | -------- | ----------- |
-| `qps-8` | 8 req/s | 15 s | 64 |
-| `qps-16` | 16 req/s | 15 s | 64 |
-| `qps-24` | 24 req/s | 15 s | 64 |
+| `qps-8` | 8 req/s | 45 s | 128 |
+| `qps-16` | 16 req/s | 45 s | 128 |
+| `qps-24` | 24 req/s | 45 s | 128 |
+| `qps-32` | 32 req/s | 45 s | 128 |
 
-With the checked-in seed, these stages generate 120, 235 and 324 requests
-respectively (679 total). The exact count is deterministic, while the
-inter-arrival offsets remain Poisson-distributed within each stage.
+With the checked-in seed, these stages generate 352, 690, 1,041 and 1,491
+requests respectively (3,574 total). The longer stages provide enough samples
+to distinguish a repeatable change from normal run-to-run noise. The 32 QPS
+stage adds a stronger overlap point, and four-token outputs keep the profile
+focused on Prefill rather than Decode. The exact count is deterministic, while
+the inter-arrival offsets remain Poisson-distributed within each stage.
 
 The generated system and user messages are unique per request, so cache hits
 should remain negligible. The different prompt sizes create overlapping
@@ -136,9 +140,12 @@ bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/load-balance-active-tokens.json
 ```
 
-For a stronger stress point, repeat with `CONCURRENCY=128`. Compare A and B by
-stage, focusing on Prefill queue time, TTFT p95/p99 and the per-Prefiller load
-distribution; do not use cache-hit rate as the success metric.
+Compare A and B by stage, focusing on Prefill queue time, TTFT p95/p99 and
+`prefill_backend_balance` in each summary. Candidate health samples also expose
+the instantaneous `active_tokens`, `active_kv_cache`, priority and selection
+count for every Prefiller. Do not use cache-hit rate as the success metric;
+near-zero hits are expected because every prompt is unique. B and C should be
+close because this profile intentionally supplies no affinity key.
 
 ### `shared-prefix-capacity.json`
 

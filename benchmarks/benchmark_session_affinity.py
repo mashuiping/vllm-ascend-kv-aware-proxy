@@ -248,6 +248,32 @@ def aggregate_metric_snapshots(
     return aggregate
 
 
+def summarize_backend_balance(
+    urls: list[str],
+    metric_deltas: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    """Summarize how evenly completed work was distributed across backends."""
+    metrics = {
+        "request_success": "vllm:request_success",
+        "prompt_tokens": "vllm:prompt_tokens",
+        "prefill_computed_tokens": "vllm:request_prefill_kv_computed_tokens_sum",
+    }
+    result: dict[str, Any] = {"backends": len(urls)}
+    for label, metric in metrics.items():
+        values_by_url = {url: metric_deltas.get(url, {}).get(metric, 0.0) for url in urls}
+        values = list(values_by_url.values())
+        mean = statistics.fmean(values) if values else 0.0
+        result[label] = {
+            "by_url": values_by_url,
+            "total": sum(values),
+            "min": min(values) if values else None,
+            "max": max(values) if values else None,
+            "spread": max(values) - min(values) if values else None,
+            "cv": statistics.pstdev(values) / mean if mean > 0 else None,
+        }
+    return result
+
+
 class EndpointSampler:
     def __init__(
         self,
@@ -916,6 +942,8 @@ def summarize_health_samples(
     first_source_stats: dict[str, dict[str, int | float]] = {}
     last_source_stats: dict[str, dict[str, int | float]] = {}
     affinity_config: dict[str, int | float] = {}
+    first_selections: dict[str, int | float] = {}
+    last_selections: dict[str, int | float] = {}
 
     def numeric_stats(value: Any) -> dict[str, int | float]:
         if not isinstance(value, dict):
@@ -958,6 +986,11 @@ def summarize_health_samples(
                 if isinstance(value, (int, float)):
                     affinity_config[field] = value
             loads = health.get("prefill_loads") or {}
+            for key, value in loads.items():
+                selections = value.get("selections") if isinstance(value, dict) else None
+                if isinstance(selections, (int, float)):
+                    first_selections.setdefault(key, selections)
+                    last_selections[key] = selections
             priorities = [
                 float(value["priority"])
                 for value in loads.values()
@@ -1001,6 +1034,10 @@ def summarize_health_samples(
         if prompt_tokens:
             delta["derived_cached_token_rate"] = delta.get("cached_tokens", 0) / prompt_tokens
 
+    selection_delta = {key: last - first_selections.get(key, last) for key, last in sorted(last_selections.items())}
+    selection_values = list(selection_delta.values())
+    selection_mean = statistics.fmean(selection_values) if selection_values else 0.0
+
     return {
         "samples": len(spreads),
         "priority_spread_p50": percentile(spreads, 0.50),
@@ -1008,6 +1045,8 @@ def summarize_health_samples(
         "priority_cv_p50": percentile(cvs, 0.50),
         "priority_cv_p95": percentile(cvs, 0.95),
         "max_priority_p95": percentile(max_priorities, 0.95),
+        "selection_count_delta": selection_delta,
+        "selection_count_cv": (statistics.pstdev(selection_values) / selection_mean if selection_mean > 0 else None),
         "affinity_config": affinity_config,
         "session_affinity_stats_delta": session_delta,
         "prefix_affinity_stats_delta": prefix_delta,
@@ -1142,6 +1181,9 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
         "measurement_metrics_delta_by_role.prefill.derived:mean:vllm:request_queue_time_seconds",
         "measurement_metrics_delta_by_role.decode.derived:mean:vllm:request_queue_time_seconds",
         "proxy_prefill_load_balance_measurement.priority_cv_p95",
+        "prefill_backend_balance.request_success.cv",
+        "prefill_backend_balance.prompt_tokens.cv",
+        "prefill_backend_balance.prefill_computed_tokens.cv",
         ("proxy_prefill_load_balance_measurement.session_affinity_stats_delta." "derived_overload_fallback_rate"),
         ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_prefix_hit_rate"),
         ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_spillover_rate"),
@@ -1167,6 +1209,7 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
         "prefill_time",
         "queue_time",
         "priority_cv",
+        "backend_balance",
         "fallback_rate",
         "spillover_rate",
     )
@@ -1568,6 +1611,7 @@ def main() -> int:
         "metrics_delta_by_role": metric_deltas_by_role,
         "measurement_metrics_delta_by_role": measurement_metric_deltas_by_role,
         "metrics_delta_by_url": metric_deltas,
+        "prefill_backend_balance": summarize_backend_balance(args.prefill_metrics_url, metric_deltas),
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),

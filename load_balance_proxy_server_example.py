@@ -368,6 +368,7 @@ class BackendServer:
     ordinal: int
     active_tokens: float = 0.0
     active_kv_cache: float = 0.0
+    selections: int = 0
     heap_seq: int = 0
 
 
@@ -552,6 +553,18 @@ class SharedProxyScheduler:
                 "prefill_instances": len(self.prefillers),
                 "decode_instances": len(self.decoders),
                 "request_num": self.request_num,
+                "prefill_loads": {
+                    key: {
+                        "host": entry.host,
+                        "port": entry.port,
+                        "active_tokens": entry.active_tokens,
+                        "active_kv_cache": entry.active_kv_cache,
+                        "priority": self._priority(ServerRole.PREFILL, entry, key),
+                        "selections": entry.selections,
+                        "tainted": key in self._pool(ServerRole.PREFILL).tainted,
+                    }
+                    for key, entry in sorted(self.prefillers.items(), key=lambda item: item[1].ordinal)
+                },
             }
 
     def _pick_server(
@@ -568,6 +581,7 @@ class SharedProxyScheduler:
         if key is None:
             key = self._pop_valid(role)
         entry = self._pool(role).servers[key]
+        entry.selections += 1
         entry.active_tokens += active_tokens_load
         entry.active_kv_cache += kv_cache_load
         self._push_heap(role, key)

@@ -12,39 +12,44 @@
       },
       {
         "name": "medium",
-        "system_prompt_tokens": 2048,
+        "system_prompt_tokens": 4096,
         "turn_input_tokens": 256
       },
       {
         "name": "long",
-        "system_prompt_tokens": 4096,
+        "system_prompt_tokens": 8192,
         "turn_input_tokens": 512
       }
     ]
   },
   "load": {
     "type": "poisson-overlap",
-    "concurrency": 64,
+    "concurrency": 128,
     "stages": [
       {
         "name": "qps-8",
         "rate": 8,
-        "duration": 15
+        "duration": 45
       },
       {
         "name": "qps-16",
         "rate": 16,
-        "duration": 15
+        "duration": 45
       },
       {
         "name": "qps-24",
         "rate": 24,
-        "duration": 15
+        "duration": 45
+      },
+      {
+        "name": "qps-32",
+        "rate": 32,
+        "duration": 45
       }
     ]
   },
   "request": {
-    "max_tokens": 8,
+    "max_tokens": 4,
     "temperature": 0.0
   }
 }

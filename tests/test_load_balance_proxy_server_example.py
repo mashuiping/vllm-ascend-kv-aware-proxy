@@ -140,6 +140,25 @@ def test_prefiller_active_tokens_and_kv_pressure_have_separate_lifetimes():
     assert scheduler.request_num == 0
 
 
+def test_healthcheck_exposes_prefiller_load_and_selection_counts():
+    scheduler = make_scheduler()
+    picked = scheduler.begin_request(100.0, 200.0)
+
+    health = scheduler.healthcheck()
+    selected = health["prefill_loads"][picked["key"]]
+
+    assert selected == {
+        "host": "127.0.0.1",
+        "port": 8100,
+        "active_tokens": 100.0,
+        "active_kv_cache": 200.0,
+        "priority": 160.0,
+        "selections": 1,
+        "tainted": False,
+    }
+    assert sum(load["selections"] for load in health["prefill_loads"].values()) == 1
+
+
 def test_decoder_picker_tracks_only_decoder_load():
     scheduler = make_scheduler()
 
