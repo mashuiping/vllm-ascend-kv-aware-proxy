@@ -634,6 +634,76 @@ def reset_cache(url: str, api_key: str | None, timeout: float, verify: bool) -> 
     return {"url": url, "status_code": response.status_code, "body": body}
 
 
+def reset_for_benchmark(
+    *,
+    reset_url: str,
+    prefill_base_urls: list[str],
+    api_key: str | None,
+    timeout: float,
+    verify: bool,
+) -> dict[str, Any]:
+    """Reset caches across baseline and candidate proxy reset protocols.
+
+    The upstream v0.23.0rc1 proxy returns an empty 200 response after fanning
+    out to its backends. The candidate returns a structured Prefiller-only
+    response. If the upstream fan-out fails because a Decoder has no prefix
+    cache, retry the reset directly against each Prefiller so the benchmark
+    still starts from a cold cache.
+    """
+    proxy_error: Exception | None = None
+    try:
+        result = reset_cache(reset_url, api_key, timeout, verify)
+        status_code = result.get("status_code")
+        body = result.get("body")
+        if isinstance(status_code, int) and status_code < 400:
+            if isinstance(body, dict):
+                if body.get("success") is True:
+                    if prefill_base_urls:
+                        validate_reset_fanout(result, prefill_base_urls)
+                    return result
+                proxy_error = RuntimeError(f"proxy reset reported failure: {body!r}")
+            else:
+                # The exact upstream script deliberately returns an empty
+                # 200. Normalize it for the same validation/reporting path.
+                result["legacy_proxy_reset"] = True
+                result["body"] = {
+                    "success": True,
+                    "backends": [{"target": base_url, "legacy": True} for base_url in prefill_base_urls],
+                }
+                return result
+    except Exception as exc:
+        proxy_error = exc
+
+    if not prefill_base_urls:
+        if proxy_error is not None:
+            raise proxy_error
+        raise RuntimeError(f"proxy reset failed: {reset_url}")
+
+    direct_results: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for base_url in prefill_base_urls:
+        direct_url = urljoin(base_url.rstrip("/") + "/", "reset_prefix_cache")
+        try:
+            direct_results.append(reset_cache(direct_url, api_key, timeout, verify))
+        except Exception as exc:
+            failures.append(f"{direct_url}: {exc!r}")
+    if failures:
+        raise RuntimeError(f"proxy reset failed ({proxy_error!r}) and direct Prefiller reset failed: {failures}")
+    return {
+        "url": reset_url,
+        "status_code": 200,
+        "fallback": "direct-prefiller-reset",
+        "proxy_error": repr(proxy_error) if proxy_error else None,
+        "body": {
+            "success": True,
+            "backends": [
+                {"target": base_url, "direct": result}
+                for base_url, result in zip(prefill_base_urls, direct_results, strict=True)
+            ],
+        },
+    }
+
+
 def validate_reset_fanout(reset_result: dict[str, Any], base_urls: list[str]) -> None:
     body = reset_result.get("body")
     if not isinstance(body, dict) or body.get("success") is not True:
@@ -788,7 +858,13 @@ def verify_reset_across_prefills(
         validation["drains"].append(
             {"phase": "before-verified-reset", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
         )
-        verified_reset = reset_cache(reset_url, api_key, timeout, verify)
+        verified_reset = reset_for_benchmark(
+            reset_url=reset_url,
+            prefill_base_urls=base_urls,
+            api_key=api_key,
+            timeout=timeout,
+            verify=verify,
+        )
         validation["resets"].append({"phase": "verified-reset", **verified_reset})
         validate_reset_fanout(verified_reset, base_urls)
         validation["drains"].append(
@@ -803,7 +879,13 @@ def verify_reset_across_prefills(
         validation["drains"].append(
             {"phase": "before-final-reset", **wait_for_prefills_idle(base_urls, drain_timeout, verify)}
         )
-        final_reset = reset_cache(reset_url, api_key, timeout, verify)
+        final_reset = reset_for_benchmark(
+            reset_url=reset_url,
+            prefill_base_urls=base_urls,
+            api_key=api_key,
+            timeout=timeout,
+            verify=verify,
+        )
         validation["resets"].append({"phase": "final-reset", **final_reset})
         validate_reset_fanout(final_reset, base_urls)
         validation["drains"].append(
@@ -1229,7 +1311,13 @@ def main() -> int:
         )
     elif args.reset_before:
         print("[benchmark] resetting backend prefix/affinity caches", file=sys.stderr, flush=True)
-        reset_result = reset_cache(reset_url, api_key, args.timeout, verify)
+        reset_result = reset_for_benchmark(
+            reset_url=reset_url,
+            prefill_base_urls=args.prefill_base_url,
+            api_key=api_key,
+            timeout=args.timeout,
+            verify=verify,
+        )
         reset_validation = {"verified": False, "resets": [{"phase": "unverified-reset", **reset_result}]}
         (output_dir / "reset-validation.json").write_text(
             json.dumps(reset_validation, ensure_ascii=False, indent=2, sort_keys=True),

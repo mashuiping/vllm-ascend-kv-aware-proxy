@@ -31,7 +31,7 @@ jobs:
       - name: Validate shell syntax
         run: |
           bash -n scripts/run_experiment.sh
+          bash -n scripts/run_abc_experiment.sh
           bash -n deploy/kubernetes/qwen3-32b-4p4d-tp2/deploy.sh
           bash -n deploy/kubernetes/qwen3-32b-4p4d-tp2/launch_role.sh
           bash -n deploy/kubernetes/qwen3-32b-4p4d-tp2/launch_proxy.sh
-

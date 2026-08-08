@@ -135,7 +135,7 @@ from typing import Any, cast
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -161,37 +161,9 @@ class InstanceInfo:
     decoder_score: float
     decoder_host: str
     decoder_port: int
-    prefiller_cached_tokens: int | None = None
 
 
 TAINT_PRIORITY = 1e15
-
-
-def extract_cached_tokens(response_json: dict) -> int | None:
-    usage = response_json.get("usage") or {}
-    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-    cached_tokens = prompt_tokens_details.get("cached_tokens")
-    return cached_tokens if isinstance(cached_tokens, int) else None
-
-
-def update_cached_tokens_in_chunk(chunk_json: dict, cached_tokens: int | None) -> bool:
-    if cached_tokens is None:
-        return False
-    usage = chunk_json.get("usage")
-    if not isinstance(usage, dict):
-        return False
-    prompt_tokens_details = usage.get("prompt_tokens_details")
-    if not isinstance(prompt_tokens_details, dict):
-        prompt_tokens_details = {}
-    usage["prompt_tokens_details"] = prompt_tokens_details
-    prompt_tokens_details["cached_tokens"] = cached_tokens
-    return True
-
-
-def encode_response_chunk(chunk_json: dict, is_sse: bool) -> bytes:
-    chunk = json.dumps(chunk_json, ensure_ascii=False).encode("utf-8")
-    return b"data: " + chunk + b"\n\n" if is_sse else chunk
-
 
 global_args: argparse.Namespace | None = None
 shared_scheduler: "SharedProxyScheduler | None" = None
@@ -950,11 +922,9 @@ async def assign_instances(
         await _abort_prefill_selection(runtime, prefiller_key, prefiller_score, is_initial_request=is_initial_request)
         raise
 
-    response_json = response.json()
-    kv_transfer_params = response_json.get("kv_transfer_params", {})
+    kv_transfer_params = response.json().get("kv_transfer_params", {})
     if kv_transfer_params:
         req_data["kv_transfer_params"] = kv_transfer_params
-    prefiller_cached_tokens = extract_cached_tokens(response_json)
 
     try:
         decoder = await runtime.schedule("pick_decoder", decoder_score)
@@ -973,7 +943,6 @@ async def assign_instances(
         decoder_score=decoder_score,
         decoder_host=decoder["host"],
         decoder_port=decoder["port"],
-        prefiller_cached_tokens=prefiller_cached_tokens,
     )
 
 
@@ -1018,7 +987,6 @@ async def handle_completions_impl(api: str, request: Request):
             retry_count = 0
             retry = True
             completion_tokens = 0
-            reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
 
             async def release_prefill_kv_once() -> None:
                 nonlocal released_kv
@@ -1050,8 +1018,7 @@ async def handle_completions_impl(api: str, request: Request):
                             continue
                         if not chunk_str:
                             continue
-                        is_sse = chunk_str.startswith("data: ")
-                        if is_sse:
+                        if chunk_str.startswith("data: "):
                             chunk_str = chunk_str[len("data: ") :]
                         try:
                             chunk_json = json.loads(chunk_str)
@@ -1061,8 +1028,6 @@ async def handle_completions_impl(api: str, request: Request):
                             continue
                         choices = chunk_json.get("choices", [])
                         if not choices:
-                            if update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens):
-                                chunk = encode_response_chunk(chunk_json, is_sse)
                             yield chunk
                             continue
 
@@ -1096,7 +1061,7 @@ async def handle_completions_impl(api: str, request: Request):
                                 choice["message"]["content"] = generated_token
                             else:
                                 choice["text"] = generated_token
-                            chunk = encode_response_chunk(chunk_json, is_sse)
+                            chunk = json.dumps(chunk_json).encode("utf-8")
                         yield chunk
             except asyncio.CancelledError:
                 logger.warning(
@@ -1196,47 +1161,22 @@ async def reset_prefix_cache(request: Request):
     runtime = get_runtime()
     await runtime.sync_clients()
     snapshot = runtime.scheduler.get_snapshot()
-    # Prefillers own the prefix KV in this PD topology; Decoders run with
-    # --no-enable-prefix-caching, so fan-out to decode is unnecessary.
+    backend_instances = [(ServerRole.PREFILL, server) for server in snapshot["prefill_instances"]] + [
+        (ServerRole.DECODE, server) for server in snapshot["decode_instances"]
+    ]
     failures: list[str] = []
-    backends: list[dict[str, Any]] = []
-    for server in snapshot["prefill_instances"]:
+    for role, server in backend_instances:
         base_url = build_server_url(server["host"], server["port"])
-        started = time.monotonic()
-        result: dict[str, Any] = {"target": base_url}
         try:
-            client = await runtime.get_client(ServerRole.PREFILL, server_key(server["host"], server["port"]))
+            client = await runtime.get_client(role, server_key(server["host"], server["port"]))
             resp = await client.post(f"{base_url}/reset_prefix_cache", params=params)
-            result["status_code"] = resp.status_code
-            try:
-                body: Any = resp.json()
-            except ValueError:
-                body = resp.text[:2048]
-            result["body"] = body
             resp.raise_for_status()
-            explicit_failure = body is False or (
-                isinstance(body, dict)
-                and (
-                    body.get("success") is False
-                    or body.get("reset") is False
-                    or str(body.get("status", "")).lower() in {"failed", "failure", "error"}
-                )
-            )
-            if explicit_failure:
-                raise RuntimeError(f"backend reported reset failure: {body!r}")
         except Exception as e:
             logger.error("reset_prefix_cache failed for %s: %s", base_url, e)
             failures.append(base_url)
-            result["error"] = repr(e)
-        finally:
-            result["elapsed_seconds"] = time.monotonic() - started
-            backends.append(result)
     if failures:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "failed": failures, "backends": backends},
-        )
-    return JSONResponse(status_code=200, content={"success": True, "backends": backends})
+        return JSONResponse(status_code=500, content={"failed": failures})
+    return Response(status_code=200)
 
 
 @app.get("/healthcheck")

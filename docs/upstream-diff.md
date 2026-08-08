@@ -1,6 +1,7 @@
 # Candidate versus upstream baseline
 
-The candidate starts from the exact file documented in [`UPSTREAM.md`](../UPSTREAM.md).
+The candidate starts from the exact file documented in
+[`baseline/README.md`](../baseline/README.md).
 Its functional changes are intentionally limited to the following areas.
 
 ## Added

@@ -33,41 +33,56 @@ When `--enable-kv-cache-aware-routing` is present, the Prefiller route order is:
 2. a text-only prefix-hash binding;
 3. the existing load-tracking heap.
 
-Supported session identifiers, in priority order:
+Session identifiers are matched with first-match-wins semantics in this order:
 
 1. `X-Session-ID` header;
 2. `X-Claude-Code-Session-ID` header;
 3. top-level JSON `session_id`;
 4. JSON `session_params.session_id`.
 
-Headers win over body fields. User, tenant, request and trace identifiers are
-intentionally excluded because they are either too broad or change on every
-request.
+Headers win over body fields; the body fields are tried in order. User, tenant,
+request and trace identifiers are intentionally excluded because they are
+either too broad or change on every request.
 
 Prefix hashing supports string `prompt` values and chat messages whose roles
 and contents are plain strings. Tool calls, tool definitions, structured
 content and multimodal requests safely fall back to normal load-based routing
 because the proxy cannot reproduce their model-specific token prefix exactly.
+The hash namespace also covers the canonicalization version, endpoint kind,
+model name and the OpenAI `prompt_cache_key`, so identical text rendered by
+different templates or cache buckets does not collide on the same Prefiller.
 
 The candidate also restores the Prefiller `active_tokens` lifecycle that
 existed before the shared-scheduler refactor: active Prefill compute and
 longer-lived KV-transfer pressure are reserved together, then released at their
-respective completion points.
+respective completion points. Bindings are committed only after a successful
+Prefill response; failed Prefill rolls back both reservations. Bindings are
+invalidated when a Prefiller drains, is removed via the dynamic-instance
+endpoints, or has its prefix cache reset.
+
+With `--enable-reusable-prefix-affinity-gate` (off by default), the commit of
+session/prefix bindings is further gated on the Prefill response's
+`reusable_prefix_tokens = cached_tokens + created_cache_tokens`. When both
+fields are reported and the sum is zero the proxy skips binding; when one or
+both fields are missing the proxy logs a warning and falls back to the
+optimistic-bind path. The gate requires Prefillers to run with
+`--enable-prompt-tokens-details` and is a no-op without
+`--enable-kv-cache-aware-routing`.
 
 See [docs/design.md](docs/design.md) and
 [docs/limitations.md](docs/limitations.md) for details.
 
 ## Provenance
 
-The unmodified upstream baseline is pinned to vllm-ascend commit:
+The unmodified upstream baseline is pinned to the vllm-ascend tag:
 
 ```text
-8f3fd59a203c3b35f29b6a77f459c9a78da7d5c0
+v0.23.0rc1
 ```
 
 The exact baseline is stored in `baseline/` so experiments do not silently
-change when upstream `main` moves. See [UPSTREAM.md](UPSTREAM.md) for the source
-path and checksums.
+change when upstream `main` moves. See [baseline/README.md](baseline/README.md)
+for the source path and selected tag.
 
 ## Run unit tests
 
@@ -105,8 +120,12 @@ python load_balance_proxy_server_example.py \
   --prefix-lru-size 1024
 ```
 
-- `--enable-reusable-prefix-affinity-gate` (optional): skip affinity commit when
-  the Prefill response shows no reusable prefix. See `docs/design.md`.
+When `--workers > 1` is used, the parent process bootstraps the shared
+scheduler (session/prefix LRUs and load heap) and serves it to uvicorn workers
+through a `multiprocessing.managers` connection, so affinity state stays
+consistent across workers. `--enable-reusable-prefix-affinity-gate` is an
+optional add-on that skips binding when the Prefill response shows no
+reusable prefix; see [docs/design.md](docs/design.md).
 
 Example request:
 
@@ -125,6 +144,25 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Omit `--enable-kv-cache-aware-routing` to run the candidate with affinity
 disabled.
+
+## Operational endpoints
+
+The proxy exposes the following operational endpoints inherited from the
+upstream toy proxy. They are independent of KV-aware routing and behave the
+same regardless of the flags above.
+
+- `GET /healthcheck` — returns the proxy status together with the live count
+  of Prefillers and Decoders.
+- `POST /instances/add` — adds Prefiller or Decoder instances at runtime.
+  Body: `{"type": "prefill" | "decode", "instances": ["host:port", ...]}`.
+  The proxy waits for newly added instances to become reachable.
+- `POST /instances/remove` — removes Prefiller or Decoder instances at
+  runtime. Body: `{"type": "prefill" | "decode", "instances": "host:port"}`.
+  Bindings that referenced a removed instance are invalidated.
+- `POST /reset_prefix_cache` — resets the prefix cache on every live
+  Prefiller. On any partial failure the response is `500`; in all cases the
+  session and prefix LRUs are cleared conservatively so a stale binding
+  cannot route to KV that no longer exists.
 
 ## Kubernetes quick start
 
@@ -218,4 +256,4 @@ comparison rules are documented in
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [UPSTREAM.md](UPSTREAM.md).
+Apache License 2.0. See [LICENSE](LICENSE) and [baseline/README.md](baseline/README.md).

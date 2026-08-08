@@ -105,9 +105,7 @@ def override_system_prompt_tokens(
         raise ValueError("system_prompt_tokens override must be positive")
     data = profile.get("data")
     if not isinstance(data, dict) or "system_prompt_tokens" not in data:
-        raise ValueError(
-            "system_prompt_tokens override is supported only for profiles with data.system_prompt_tokens"
-        )
+        raise ValueError("system_prompt_tokens override is supported only for profiles with data.system_prompt_tokens")
     effective = dict(profile)
     effective["data"] = dict(data)
     effective["data"]["system_prompt_tokens"] = system_prompt_tokens
@@ -381,9 +379,7 @@ def generate_load_balance_workload(
         stage_rng = random.Random(rng.randrange(2**63))
         offsets = _poisson_offsets(rate, duration, stage_rng)
         for request_index, offset in enumerate(offsets):
-            class_name, system_tokens, input_tokens = classes[
-                (request_index + stage_index) % len(classes)
-            ]
+            class_name, system_tokens, input_tokens = classes[(request_index + stage_index) % len(classes)]
             label = f"load-balance-{seed}-{stage_index:03d}-{request_index:08d}-{class_name}"
             records.append(
                 PlannedRequest(

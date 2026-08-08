@@ -217,6 +217,55 @@ def test_validate_reset_fanout_rejects_missing_prefill():
         benchmark.validate_reset_fanout(result, ["http://p0:7100", "http://p1:7100"])
 
 
+def test_reset_for_benchmark_accepts_upstream_empty_success(monkeypatch):
+    base_urls = ["http://p0:7100", "http://p1:7100"]
+
+    monkeypatch.setattr(
+        benchmark,
+        "reset_cache",
+        lambda *args, **kwargs: {"url": args[0], "status_code": 200, "body": ""},
+    )
+
+    result = benchmark.reset_for_benchmark(
+        reset_url="http://proxy/reset_prefix_cache",
+        prefill_base_urls=base_urls,
+        api_key=None,
+        timeout=10,
+        verify=True,
+    )
+
+    assert result["legacy_proxy_reset"] is True
+    assert [item["target"] for item in result["body"]["backends"]] == base_urls
+
+
+def test_reset_for_benchmark_falls_back_to_direct_prefillers(monkeypatch):
+    base_urls = ["http://p0:7100", "http://p1:7100"]
+    calls = []
+
+    def fake_reset(url, *_args, **_kwargs):
+        calls.append(url)
+        if url.startswith("http://proxy"):
+            raise RuntimeError("decoder does not expose prefix cache")
+        return {"url": url, "status_code": 200, "body": ""}
+
+    monkeypatch.setattr(benchmark, "reset_cache", fake_reset)
+
+    result = benchmark.reset_for_benchmark(
+        reset_url="http://proxy/reset_prefix_cache",
+        prefill_base_urls=base_urls,
+        api_key=None,
+        timeout=10,
+        verify=True,
+    )
+
+    assert result["fallback"] == "direct-prefiller-reset"
+    assert calls == [
+        "http://proxy/reset_prefix_cache",
+        "http://p0:7100/reset_prefix_cache",
+        "http://p1:7100/reset_prefix_cache",
+    ]
+
+
 def test_main_runs_frozen_workload_with_separate_warmup_and_cache_fill(
     tmp_path: Path,
     monkeypatch,
