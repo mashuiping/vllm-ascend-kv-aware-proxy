@@ -12,12 +12,12 @@
       },
       {
         "name": "medium",
-        "system_prompt_tokens": 4096,
+        "system_prompt_tokens": 2048,
         "turn_input_tokens": 256
       },
       {
         "name": "long",
-        "system_prompt_tokens": 8192,
+        "system_prompt_tokens": 4096,
         "turn_input_tokens": 512
       }
     ]

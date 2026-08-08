@@ -15,7 +15,7 @@ in this directory alongside the checked-in workload profiles.
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
-| `load-balance-active-tokens.json` | Unique 512/4,096/8,192-token prompt classes, continuous Poisson overlap at 8/16/24/32 QPS, concurrency 128 | A/B Prefill active-token load balancing |
+| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, continuous Poisson overlap at 8/16/24/32 QPS, concurrency 128 | A/B Prefill active-token load balancing |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -108,7 +108,7 @@ every request has a unique prompt, session headers are disabled, and the
 primary comparison is Prefill queue time, TTFT tail latency and per-node load
 balance.
 
-The workload cycles through three prompt-size classes (512, 4,096 and 8,192
+The workload cycles through three prompt-size classes (512, 2,048 and 4,096
 system tokens, with correspondingly different user inputs) while requests
 arrive according to deterministic Poisson offsets:
 
@@ -125,6 +125,12 @@ to distinguish a repeatable change from normal run-to-run noise. The 32 QPS
 stage adds a stronger overlap point, and four-token outputs keep the profile
 focused on Prefill rather than Decode. The exact count is deterministic, while
 the inter-arrival offsets remain Poisson-distributed within each stage.
+
+The profile contains 8,995,072 input tokens per group (26,985,216 across
+A/B/C). Workload construction verifies unique text against the served
+tokenizer with 16 concurrent workers by default. Set
+`TOKENIZER_CONCURRENCY=1` to serialize generation or lower the value if the
+tokenizer endpoint is resource constrained.
 
 The generated system and user messages are unique per request, so cache hits
 should remain negligible. The different prompt sizes create overlapping

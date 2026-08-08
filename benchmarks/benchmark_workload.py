@@ -7,6 +7,7 @@ import json
 import math
 import random
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -54,11 +55,13 @@ class TokenTextFactory:
         self,
         tokenize: Callable[[str], list[int]] | None = None,
         detokenize: Callable[[list[int]], str] | None = None,
+        max_workers: int = 1,
     ):
         if (tokenize is None) != (detokenize is None):
             raise ValueError("tokenize and detokenize must be supplied together")
         self._tokenize = tokenize
         self._detokenize = detokenize
+        self._max_workers = max(1, int(max_workers))
         self.verified = tokenize is not None
 
     def make(self, label: str, target_tokens: int) -> str:
@@ -81,6 +84,12 @@ class TokenTextFactory:
         if len(actual) != target_tokens:
             raise ValueError(f"tokenizer round trip produced {len(actual)} tokens; expected {target_tokens}")
         return text
+
+    def make_many(self, specs: list[tuple[str, int]]) -> list[str]:
+        if self._max_workers == 1 or len(specs) < 2:
+            return [self.make(label, target_tokens) for label, target_tokens in specs]
+        with ThreadPoolExecutor(max_workers=min(self._max_workers, len(specs))) as executor:
+            return list(executor.map(lambda spec: self.make(*spec), specs))
 
 
 def load_profile(path: Path) -> dict[str, Any]:
@@ -366,7 +375,8 @@ def generate_load_balance_workload(
         raise ValueError("load.stages must contain at least one QPS stage")
     max_tokens, temperature = _request_settings(profile)
     rng = random.Random(seed)
-    records: list[PlannedRequest] = []
+    plans: list[tuple[int, int, str, float, str, int, int]] = []
+    text_specs: list[tuple[str, int]] = []
     sequence = 0
     for stage_index, stage in enumerate(stages):
         if not isinstance(stage, dict):
@@ -381,32 +391,42 @@ def generate_load_balance_workload(
         for request_index, offset in enumerate(offsets):
             class_name, system_tokens, input_tokens = classes[(request_index + stage_index) % len(classes)]
             label = f"load-balance-{seed}-{stage_index:03d}-{request_index:08d}-{class_name}"
-            records.append(
-                PlannedRequest(
-                    sequence=sequence,
-                    phase="measure",
-                    stage=stage_name,
-                    scheduled_offset_s=offset,
-                    session_index=sequence,
-                    session_id=f"bench-load-balance-{seed}-{sequence:08d}",
-                    turn=stage_index,
-                    scenario="load-balance",
-                    send_session_key=False,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": text_factory.make(f"{label}-system", system_tokens),
-                        },
-                        {
-                            "role": "user",
-                            "content": text_factory.make(f"{label}-input", input_tokens),
-                        },
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
+            plans.append((sequence, stage_index, stage_name, offset, label, system_tokens, input_tokens))
+            text_specs.extend(
+                [
+                    (f"{label}-system", system_tokens),
+                    (f"{label}-input", input_tokens),
+                ]
             )
             sequence += 1
+    texts = text_factory.make_many(text_specs)
+    records: list[PlannedRequest] = []
+    for index, (sequence, stage_index, stage_name, offset, label, _, _) in enumerate(plans):
+        records.append(
+            PlannedRequest(
+                sequence=sequence,
+                phase="measure",
+                stage=stage_name,
+                scheduled_offset_s=offset,
+                session_index=sequence,
+                session_id=f"bench-load-balance-{seed}-{sequence:08d}",
+                turn=stage_index,
+                scenario="load-balance",
+                send_session_key=False,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": texts[index * 2],
+                    },
+                    {
+                        "role": "user",
+                        "content": texts[index * 2 + 1],
+                    },
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        )
     if not records:
         raise ValueError("load-balance stages produced no requests")
     return records

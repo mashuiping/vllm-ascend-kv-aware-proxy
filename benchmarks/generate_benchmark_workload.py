@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urljoin
@@ -49,20 +50,33 @@ class ServerTokenizer:
         self.model = model
         self.timeout = timeout
         self.verify = verify
-        self.http = requests.Session()
+        self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._sessions: list[requests.Session] = []
         self.tokenize_calls = 0
-        if api_key:
-            self.http.headers["Authorization"] = f"Bearer {api_key}"
+
+    def _http(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self._headers)
+            self._local.session = session
+            with self._lock:
+                self._sessions.append(session)
+        return session
 
     def tokenize(self, prompt: str) -> list[int]:
-        self.tokenize_calls += 1
-        if self.tokenize_calls == 1 or self.tokenize_calls % 25 == 0:
+        with self._lock:
+            self.tokenize_calls += 1
+            tokenize_calls = self.tokenize_calls
+        if tokenize_calls == 1 or tokenize_calls % 25 == 0:
             print(
-                f"[workload] tokenizer calls={self.tokenize_calls}",
+                f"[workload] tokenizer calls={tokenize_calls}",
                 file=sys.stderr,
                 flush=True,
             )
-        response = self.http.post(
+        response = self._http().post(
             self.tokenize_url,
             json={"model": self.model, "prompt": prompt, "add_special_tokens": False},
             timeout=self.timeout,
@@ -76,7 +90,7 @@ class ServerTokenizer:
         return tokens
 
     def detokenize(self, tokens: list[int]) -> str:
-        response = self.http.post(
+        response = self._http().post(
             self.detokenize_url,
             json={"model": self.model, "tokens": tokens},
             timeout=self.timeout,
@@ -90,7 +104,8 @@ class ServerTokenizer:
         return prompt
 
     def close(self) -> None:
-        self.http.close()
+        for session in self._sessions:
+            session.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +117,7 @@ def parse_args() -> argparse.Namespace:
         help="Direct vLLM server root exposing /tokenize and /detokenize.",
     )
     parser.add_argument("--model", help="Served model name; required with --tokenizer-url.")
+    parser.add_argument("--tokenizer-concurrency", type=int, default=16)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--insecure", action="store_true")
@@ -134,6 +150,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.system_prompt_tokens is not None and args.system_prompt_tokens <= 0:
         parser.error("--system-prompt-tokens must be a positive integer")
+    if args.tokenizer_concurrency <= 0:
+        parser.error("--tokenizer-concurrency must be a positive integer")
     return args
 
 
@@ -156,7 +174,11 @@ def main() -> int:
                 args.timeout,
                 not args.insecure,
             )
-            factory = TokenTextFactory(tokenizer.tokenize, tokenizer.detokenize)
+            factory = TokenTextFactory(
+                tokenizer.tokenize,
+                tokenizer.detokenize,
+                max_workers=args.tokenizer_concurrency,
+            )
         else:
             factory = TokenTextFactory()
         records = generate_workload(profile, factory)

@@ -86,6 +86,7 @@ run_local() {
     --tokenizer-url "${TOKENIZER_URL}" \
     --model "${MODEL}" \
     --timeout "${TOKENIZER_TIMEOUT:-120}" \
+    --tokenizer-concurrency "${TOKENIZER_CONCURRENCY:-16}" \
     "${workload_override_args[@]}"
   log "shared workload generated: ${workload_file}"
 
@@ -202,6 +203,7 @@ run_in_pod() {
       --tokenizer-url "${tokenizer_url}" \
       --model "${MODEL}" \
       --timeout "${TOKENIZER_TIMEOUT:-120}" \
+      --tokenizer-concurrency "${TOKENIZER_CONCURRENCY:-16}" \
       "${workload_override_args[@]}"
 
   local group

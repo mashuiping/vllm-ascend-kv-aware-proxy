@@ -88,6 +88,21 @@ def test_token_text_factory_uses_exact_token_round_trip():
     assert factory.verified is True
 
 
+def test_token_text_factory_make_many_preserves_order_and_uniqueness():
+    factory = TokenTextFactory(
+        tokenize=lambda text: list(text.encode("utf-8")),
+        detokenize=lambda tokens: bytes(tokens).decode("utf-8"),
+        max_workers=4,
+    )
+
+    texts = factory.make_many([(f"label-{index}", 32) for index in range(8)])
+
+    assert len(texts) == 8
+    assert len(set(texts)) == 8
+    assert all(len(text.encode("utf-8")) == 32 for text in texts)
+    assert all(text.startswith(f"label-{index}") for index, text in enumerate(texts))
+
+
 def test_session_workload_is_deterministic_and_freezes_history():
     first = generate_workload(session_profile(), TokenTextFactory())
     second = generate_workload(session_profile(), TokenTextFactory())
