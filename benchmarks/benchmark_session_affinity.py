@@ -1244,9 +1244,9 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
         "prefill_backend_balance.request_success.cv",
         "prefill_backend_balance.prompt_tokens.cv",
         "prefill_backend_balance.prefill_computed_tokens.cv",
-        ("proxy_prefill_load_balance_measurement.session_affinity_stats_delta." "derived_overload_fallback_rate"),
-        ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_prefix_hit_rate"),
-        ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta." "derived_spillover_rate"),
+        ("proxy_prefill_load_balance_measurement.session_affinity_stats_delta.derived_overload_fallback_rate"),
+        ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta.derived_prefix_hit_rate"),
+        ("proxy_prefill_load_balance_measurement.prefix_affinity_stats_delta.derived_spillover_rate"),
     ]
     baseline_stages = set((baseline.get("per_stage") or {}).keys())
     treatment_stages = set((treatment.get("per_stage") or {}).keys())
@@ -1346,7 +1346,7 @@ def main() -> int:
     )
 
     print(
-        f"[benchmark] label={args.label} requests={len(planned_records or []) or 'generated'} " f"output={output_dir}",
+        f"[benchmark] label={args.label} requests={len(planned_records or []) or 'generated'} output={output_dir}",
         file=sys.stderr,
         flush=True,
     )

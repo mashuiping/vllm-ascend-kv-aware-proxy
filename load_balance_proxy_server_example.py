@@ -1046,22 +1046,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4096,
         help=(
-            "Maximum session-to-prefiller entries when KV-cache-aware routing is enabled; "
-            "0 disables session affinity."
+            "Maximum session-to-prefiller entries when KV-cache-aware routing is enabled; 0 disables session affinity."
         ),
     )
     parser.add_argument(
         "--prefix-hash-chars",
         type=int,
         default=1024,
-        help=("Text prefix characters used when KV-cache-aware routing is enabled; " "0 disables prefix affinity."),
+        help=("Text prefix characters used when KV-cache-aware routing is enabled; 0 disables prefix affinity."),
     )
     parser.add_argument(
         "--prefix-lru-size",
         type=int,
         default=1024,
         help=(
-            "Maximum prefix-to-prefiller entries when KV-cache-aware routing is enabled; " "0 disables prefix affinity."
+            "Maximum prefix-to-prefiller entries when KV-cache-aware routing is enabled; 0 disables prefix affinity."
         ),
     )
     args = parser.parse_args()

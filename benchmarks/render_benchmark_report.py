@@ -145,9 +145,9 @@ def metric_rows(comparison: dict[str, Any], experiment_valid: bool = True) -> li
             "<tr>"
             f'<td><span class="metric-label">{html.escape(label)}</span>'
             f'<span class="metric-path">{html.escape(path)}</span></td>'
-            f'<td>{html.escape(format_value(value.get("baseline"), unit))}</td>'
-            f'<td>{html.escape(format_value(value.get("treatment"), unit))}</td>'
-            f'<td>{html.escape(format_percent(value.get("relative_change")))}</td>'
+            f"<td>{html.escape(format_value(value.get('baseline'), unit))}</td>"
+            f"<td>{html.escape(format_value(value.get('treatment'), unit))}</td>"
+            f"<td>{html.escape(format_percent(value.get('relative_change')))}</td>"
             f'<td class="{status}">{html.escape(format_percent(value.get("improvement")))}</td>'
             "</tr>"
         )
@@ -173,7 +173,7 @@ def summary_card(group: str, summary: dict[str, Any]) -> str:
             f'<div class="big">{html.escape(format_value(focus.get("ttft_ms", {}).get("p95"), "ms"))}</div>',
             f'<div class="caption">{html.escape(focus_label)} TTFT p95</div>',
             "<dl>",
-            f'<dt>Requests</dt><dd>{html.escape(str(overall.get("requests", "—")))}</dd>',
+            f"<dt>Requests</dt><dd>{html.escape(str(overall.get('requests', '—')))}</dd>",
             f"<dt>Success rate</dt><dd>{html.escape(success_rate)}</dd>",
             f"<dt>Warm E2E p95</dt><dd>{html.escape(warm_e2e_p95)}</dd>",
             f"<dt>{html.escape(focus_label)} cached ratio</dt><dd>{html.escape(cached_ratio)}</dd>",
@@ -193,11 +193,11 @@ def phase_overview(summaries: dict[str, dict[str, Any]]) -> str:
                 "<tr>"
                 f"<td>{html.escape(GROUP_LABELS[group])}</td>"
                 f"<td>{html.escape(label)}</td>"
-                f'<td>{html.escape(str(summary.get("requests", "—")))}</td>'
-                f'<td>{html.escape(format_value(summary.get("success_rate"), "%"))}</td>'
-                f'<td>{html.escape(format_value((summary.get("ttft_ms") or {}).get("p95"), "ms"))}</td>'
-                f'<td>{html.escape(format_value((summary.get("e2e_ms") or {}).get("p95"), "ms"))}</td>'
-                f'<td>{html.escape(format_value(summary.get("cached_token_ratio"), "%"))}</td>'
+                f"<td>{html.escape(str(summary.get('requests', '—')))}</td>"
+                f"<td>{html.escape(format_value(summary.get('success_rate'), '%'))}</td>"
+                f"<td>{html.escape(format_value((summary.get('ttft_ms') or {}).get('p95'), 'ms'))}</td>"
+                f"<td>{html.escape(format_value((summary.get('e2e_ms') or {}).get('p95'), 'ms'))}</td>"
+                f"<td>{html.escape(format_value(summary.get('cached_token_ratio'), '%'))}</td>"
                 "</tr>"
             )
         for stage, summary in sorted((summaries[group].get("per_stage") or {}).items()):
@@ -207,11 +207,11 @@ def phase_overview(summaries: dict[str, dict[str, Any]]) -> str:
                 "<tr>"
                 f"<td>{html.escape(GROUP_LABELS[group])}</td>"
                 f"<td>{html.escape(stage)}</td>"
-                f'<td>{html.escape(str(summary.get("requests", "—")))}</td>'
-                f'<td>{html.escape(format_value(summary.get("success_rate"), "%"))}</td>'
-                f'<td>{html.escape(format_value((summary.get("ttft_ms") or {}).get("p95"), "ms"))}</td>'
-                f'<td>{html.escape(format_value((summary.get("e2e_ms") or {}).get("p95"), "ms"))}</td>'
-                f'<td>{html.escape(format_value(summary.get("cached_token_ratio"), "%"))}</td>'
+                f"<td>{html.escape(str(summary.get('requests', '—')))}</td>"
+                f"<td>{html.escape(format_value(summary.get('success_rate'), '%'))}</td>"
+                f"<td>{html.escape(format_value((summary.get('ttft_ms') or {}).get('p95'), 'ms'))}</td>"
+                f"<td>{html.escape(format_value((summary.get('e2e_ms') or {}).get('p95'), 'ms'))}</td>"
+                f"<td>{html.escape(format_value(summary.get('cached_token_ratio'), '%'))}</td>"
                 "</tr>"
             )
     return "".join(rows)
@@ -309,7 +309,7 @@ th:first-child,td:first-child {{ text-align:left; }} tr:last-child td {{ border-
 <body><main>
 <h1>Benchmark report</h1>
 <div class="subtitle">{html.escape(experiment_dir.name)}</div>
-<div class="validity-banner {'valid' if experiment_valid else 'invalid'}">
+<div class="validity-banner {"valid" if experiment_valid else "invalid"}">
 {validity_message}
 </div>
 <div class="meta">
