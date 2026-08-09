@@ -72,6 +72,7 @@ Important optional settings:
 | `DECODE_MAX_BATCHED_TOKENS` | `512` |
 | `PREFILL_MAX_NUM_SEQS` | `32` |
 | `DECODE_MAX_NUM_SEQS` | `64` |
+| `PROXY_DECODER_COUNT` | `4` |
 | `GPU_MEMORY_UTILIZATION` | `0.90` |
 | `SESSION_LRU_SIZE` | `4096` |
 | `PREFIX_HASH_CHARS` | `1024` |
@@ -80,6 +81,13 @@ Important optional settings:
 The default uses Qwen3-32B's native 32K context window and does not require
 RoPE scaling. Prefill remains chunked at 4,096 tokens by default, so longer
 prompts do not require a matching increase in `PREFILL_MAX_BATCHED_TOKENS`.
+
+`PROXY_DECODER_COUNT` controls how many of the four already-running Decoder
+Pods are included in the Proxy backend list. Values 1 through 4 select the
+stable StatefulSet backends starting at `pd-decode-0`; changing it redeploys
+only the Proxy and does not change or restart the Decoder engines. It is useful
+for targeted pressure experiments. `DECODE_MAX_NUM_SEQS`, by contrast, is a
+vLLM engine startup argument and changing it requires a Decoder rollout.
 
 ## Select an experiment group
 

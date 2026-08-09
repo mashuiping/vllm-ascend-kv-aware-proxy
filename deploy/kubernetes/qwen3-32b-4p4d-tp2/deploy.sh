@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 PROXY_VARIANT="${PROXY_VARIANT:-candidate}"
 KV_AWARE_ROUTING="${KV_AWARE_ROUTING:-true}"
+PROXY_DECODER_COUNT="${PROXY_DECODER_COUNT:-4}"
 SESSION_LRU_SIZE="${SESSION_LRU_SIZE:-4096}"
 PREFIX_HASH_CHARS="${PREFIX_HASH_CHARS:-1024}"
 PREFIX_LRU_SIZE="${PREFIX_LRU_SIZE:-1024}"
@@ -65,6 +66,7 @@ Supported settings and defaults:
   PROXY_SOURCE_PATH=<absolute path>/load_balance_proxy_server_example.py
   PROXY_VARIANT=candidate  # candidate or baseline
   KV_AWARE_ROUTING=true    # candidate only; true or false
+  PROXY_DECODER_COUNT=4    # proxy-visible Decoder backends; 1 through 4
   SESSION_LRU_SIZE=4096
   PREFIX_HASH_CHARS=1024
   PREFIX_LRU_SIZE=1024
@@ -124,6 +126,7 @@ render() {
     -e "s|__REASONING_PARSER__|$(escape_sed_replacement "${REASONING_PARSER}")|g" \
     -e "s|__PROXY_VARIANT__|$(escape_sed_replacement "${PROXY_VARIANT}")|g" \
     -e "s|__KV_AWARE_ROUTING__|$(escape_sed_replacement "${KV_AWARE_ROUTING}")|g" \
+    -e "s|__PROXY_DECODER_COUNT__|$(escape_sed_replacement "${PROXY_DECODER_COUNT}")|g" \
     -e "s|__SESSION_LRU_SIZE__|$(escape_sed_replacement "${SESSION_LRU_SIZE}")|g" \
     -e "s|__PREFIX_HASH_CHARS__|$(escape_sed_replacement "${PREFIX_HASH_CHARS}")|g" \
     -e "s|__PREFIX_LRU_SIZE__|$(escape_sed_replacement "${PREFIX_LRU_SIZE}")|g" \
@@ -143,6 +146,13 @@ validate_proxy_source() {
     echo "KV_AWARE_ROUTING must be false when PROXY_VARIANT=baseline" >&2
     exit 2
   fi
+  case "${PROXY_DECODER_COUNT}" in
+    1|2|3|4) ;;
+    *)
+      echo "PROXY_DECODER_COUNT must be 1, 2, 3, or 4: ${PROXY_DECODER_COUNT}" >&2
+      exit 2
+      ;;
+  esac
   if [[ "${PROXY_SOURCE_PATH}" != /* ]]; then
     echo "PROXY_SOURCE_PATH must be an absolute path: ${PROXY_SOURCE_PATH}" >&2
     exit 2

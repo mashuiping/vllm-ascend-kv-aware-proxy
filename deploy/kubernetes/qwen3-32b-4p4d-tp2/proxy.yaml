@@ -37,6 +37,7 @@ spec:
           env:
             - {name: PROXY_VARIANT, value: "__PROXY_VARIANT__"}
             - {name: KV_AWARE_ROUTING, value: "__KV_AWARE_ROUTING__"}
+            - {name: PROXY_DECODER_COUNT, value: "__PROXY_DECODER_COUNT__"}
             - {name: SESSION_LRU_SIZE, value: "__SESSION_LRU_SIZE__"}
             - {name: PREFIX_HASH_CHARS, value: "__PREFIX_HASH_CHARS__"}
             - {name: PREFIX_LRU_SIZE, value: "__PREFIX_LRU_SIZE__"}
@@ -59,16 +60,6 @@ spec:
             - "7100"
             - "7100"
             - "7100"
-            - --decoder-hosts
-            - pd-decode-0.pd-decode
-            - pd-decode-1.pd-decode
-            - pd-decode-2.pd-decode
-            - pd-decode-3.pd-decode
-            - --decoder-ports
-            - "7200"
-            - "7200"
-            - "7200"
-            - "7200"
           ports:
             - {name: http, containerPort: 8000}
           startupProbe:

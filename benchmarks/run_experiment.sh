@@ -48,6 +48,7 @@ benchmark_args=(
   --sessions "${SESSIONS:-256}"
   --turns "${TURNS:-6}"
   --concurrency "${CONCURRENCY:-64}"
+  --expected-decode-count "${PROXY_DECODER_COUNT:-4}"
   --prefix-words "${PREFIX_WORDS:-1024}"
   --max-tokens "${MAX_TOKENS:-16}"
   --seed "${SEED:-20260724}"

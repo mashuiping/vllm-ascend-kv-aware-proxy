@@ -937,6 +937,13 @@ def summarize_health_samples(
     spreads: list[float] = []
     cvs: list[float] = []
     max_priorities: list[float] = []
+    active_token_totals: list[float] = []
+    active_kv_totals: list[float] = []
+    estimated_waiting_kv_totals: list[float] = []
+    lifecycle_overlap_samples = 0
+    lifecycle_skew_samples = 0
+    shadow_heap_divergence_samples = 0
+    decode_instance_counts: list[int] = []
     first_stats_by_field: dict[str, dict[str, int | float]] = {}
     last_stats_by_field: dict[str, dict[str, int | float]] = {}
     first_source_stats: dict[str, dict[str, int | float]] = {}
@@ -964,6 +971,9 @@ def summarize_health_samples(
             if start_timestamp is not None and float(sample.get("timestamp", 0)) < start_timestamp:
                 continue
             health = sample.get("value") or {}
+            decode_instances = health.get("decode_instances")
+            if isinstance(decode_instances, int):
+                decode_instance_counts.append(decode_instances)
             for field in ("session_affinity_stats", "prefix_affinity_stats"):
                 current = numeric_stats(health.get(field))
                 if current:
@@ -991,6 +1001,35 @@ def summarize_health_samples(
                 if isinstance(selections, (int, float)):
                     first_selections.setdefault(key, selections)
                     last_selections[key] = selections
+            lifecycle_rows: list[tuple[int, float, float]] = []
+            for fallback_ordinal, value in enumerate(loads.values()):
+                if not isinstance(value, dict) or value.get("tainted") is True:
+                    continue
+                active_tokens = value.get("active_tokens")
+                active_kv_cache = value.get("active_kv_cache")
+                if not isinstance(active_tokens, (int, float)) or not isinstance(active_kv_cache, (int, float)):
+                    continue
+                ordinal = value.get("ordinal", fallback_ordinal)
+                if not isinstance(ordinal, int):
+                    ordinal = fallback_ordinal
+                lifecycle_rows.append((ordinal, max(0.0, float(active_tokens)), max(0.0, float(active_kv_cache))))
+            if lifecycle_rows:
+                active_total = sum(row[1] for row in lifecycle_rows)
+                kv_total = sum(row[2] for row in lifecycle_rows)
+                waiting_total = sum(max(0.0, row[2] - row[1]) for row in lifecycle_rows)
+                if kv_total > 0:
+                    active_token_totals.append(active_total)
+                    active_kv_totals.append(kv_total)
+                    estimated_waiting_kv_totals.append(waiting_total)
+                    if active_total > 0 and waiting_total > 0:
+                        lifecycle_overlap_samples += 1
+                    phase_ratios = [row[1] / row[2] for row in lifecycle_rows if row[2] > 0]
+                    if len(phase_ratios) >= 2 and max(phase_ratios) - min(phase_ratios) > 1e-9:
+                        lifecycle_skew_samples += 1
+                    baseline_pick = min(lifecycle_rows, key=lambda row: (0.3 * row[2], row[0]))[0]
+                    candidate_pick = min(lifecycle_rows, key=lambda row: (row[1] + 0.3 * row[2], row[0]))[0]
+                    if baseline_pick != candidate_pick:
+                        shadow_heap_divergence_samples += 1
             priorities = [
                 float(value["priority"])
                 for value in loads.values()
@@ -1037,14 +1076,30 @@ def summarize_health_samples(
     selection_delta = {key: last - first_selections.get(key, last) for key, last in sorted(last_selections.items())}
     selection_values = list(selection_delta.values())
     selection_mean = statistics.fmean(selection_values) if selection_values else 0.0
+    lifecycle_sample_count = len(active_token_totals)
 
     return {
         "samples": len(spreads),
+        "lifecycle_samples": lifecycle_sample_count,
         "priority_spread_p50": percentile(spreads, 0.50),
         "priority_spread_p95": percentile(spreads, 0.95),
         "priority_cv_p50": percentile(cvs, 0.50),
         "priority_cv_p95": percentile(cvs, 0.95),
         "max_priority_p95": percentile(max_priorities, 0.95),
+        "active_tokens_total_p50": percentile(active_token_totals, 0.50),
+        "active_kv_cache_total_p50": percentile(active_kv_totals, 0.50),
+        "estimated_waiting_kv_total_p50": percentile(estimated_waiting_kv_totals, 0.50),
+        "lifecycle_overlap_sample_rate": (
+            lifecycle_overlap_samples / lifecycle_sample_count if lifecycle_sample_count else None
+        ),
+        "lifecycle_skew_sample_rate": (
+            lifecycle_skew_samples / lifecycle_sample_count if lifecycle_sample_count else None
+        ),
+        "shadow_heap_divergence_sample_rate": (
+            shadow_heap_divergence_samples / lifecycle_sample_count if lifecycle_sample_count else None
+        ),
+        "decode_instance_count_min": min(decode_instance_counts) if decode_instance_counts else None,
+        "decode_instance_count_max": max(decode_instance_counts) if decode_instance_counts else None,
         "selection_count_delta": selection_delta,
         "selection_count_cv": (statistics.pstdev(selection_values) / selection_mean if selection_mean > 0 else None),
         "affinity_config": affinity_config,
@@ -1117,6 +1172,7 @@ def parse_args() -> argparse.Namespace:
         help="Prime, reset, and probe every --prefill-base-url before measurement.",
     )
     parser.add_argument("--expected-prefill-count", type=int, default=0)
+    parser.add_argument("--expected-decode-count", type=int, default=0)
     parser.add_argument("--reset-drain-timeout", type=float, default=120.0)
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
     parser.add_argument("--seed", type=int, default=20260724)
@@ -1137,10 +1193,14 @@ def parse_args() -> argparse.Namespace:
         setattr(args, name, list(dict.fromkeys(getattr(args, name))))
     if args.sessions <= 0 or args.turns <= 0 or args.concurrency <= 0:
         parser.error("sessions, turns, and concurrency must be positive")
+    if args.sample_interval <= 0:
+        parser.error("sample-interval must be positive")
     if args.system_warmup_requests < 0:
         parser.error("system-warmup-requests must be non-negative")
     if args.expected_prefill_count < 0:
         parser.error("expected-prefill-count must be non-negative")
+    if args.expected_decode_count < 0:
+        parser.error("expected-decode-count must be non-negative")
     if args.reset_drain_timeout <= 0:
         parser.error("reset-drain-timeout must be positive")
     if args.verify_reset and not args.reset_before:
@@ -1630,6 +1690,14 @@ def main() -> int:
         "decode_metrics_complete": (
             not args.decode_metrics_url
             or all(url in sampler.before and url in sampler.after for url in args.decode_metrics_url)
+        ),
+        "decode_count_matches": (
+            not args.expected_decode_count
+            or (
+                summary["proxy_prefill_load_balance"]["decode_instance_count_min"]
+                == args.expected_decode_count
+                == summary["proxy_prefill_load_balance"]["decode_instance_count_max"]
+            )
         ),
     }
     if scenario == "session-long" and args.reset_before:

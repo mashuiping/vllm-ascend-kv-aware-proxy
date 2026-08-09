@@ -557,6 +557,7 @@ class SharedProxyScheduler:
                     key: {
                         "host": entry.host,
                         "port": entry.port,
+                        "ordinal": entry.ordinal,
                         "active_tokens": entry.active_tokens,
                         "active_kv_cache": entry.active_kv_cache,
                         "priority": self._priority(ServerRole.PREFILL, entry, key),

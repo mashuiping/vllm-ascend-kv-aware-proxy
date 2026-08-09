@@ -3,6 +3,12 @@
   "name": "load-balance-active-tokens",
   "scenario": "load-balance",
   "seed": 20260724,
+  "deployment": {
+    "proxy_decoder_count": 2
+  },
+  "observability": {
+    "sample_interval_s": 0.1
+  },
   "data": {
     "prompt_classes": [
       {
@@ -24,32 +30,32 @@
   },
   "load": {
     "type": "poisson-overlap",
-    "concurrency": 128,
+    "concurrency": 192,
     "stages": [
+      {
+        "name": "qps-4",
+        "rate": 4,
+        "duration": 5
+      },
       {
         "name": "qps-8",
         "rate": 8,
-        "duration": 45
+        "duration": 5
       },
       {
         "name": "qps-16",
         "rate": 16,
-        "duration": 45
+        "duration": 5
       },
       {
         "name": "qps-24",
         "rate": 24,
-        "duration": 45
-      },
-      {
-        "name": "qps-32",
-        "rate": 32,
-        "duration": 45
+        "duration": 5
       }
     ]
   },
   "request": {
-    "max_tokens": 4,
+    "max_tokens": 256,
     "temperature": 0.0
   }
 }

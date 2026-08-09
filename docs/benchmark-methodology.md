@@ -16,7 +16,11 @@ A versus C only as the end-to-end comparison with stock upstream.
 
 ## Control variables
 
-- Keep P/D Pods, model, image, scheduler arguments and hardware unchanged.
+- Keep P/D Pods, model, image, scheduler arguments and hardware unchanged
+  within every A/B/C comparison. A diagnostic profile may expose only a subset
+  of already-running backends through the Proxy, but A, B and C must use the
+  same subset and the result must be labelled as a mechanism-validation
+  topology rather than a production-capacity comparison.
 - Restart only the proxy between groups by default.
 - Drain all Prefillers, reset backend prefix caches and verify every direct
   Prefiller is cold before every measured run.
@@ -37,15 +41,18 @@ benchmark command, per-Prefiller reset outcome and experiment validity result.
 | --- | --- |
 | `session-long` | Main multi-turn session-locality case |
 | `shared-prefix` | Cross-session shared system-prompt locality |
-| `load-balance` | Continuous heterogeneous Prefill load for A/B active-token scoring |
+| `load-balance` | Heterogeneous Prefill load plus controlled Decode backpressure for A/B active-token lifecycle scoring |
 | `short` | Negative control below useful cache granularity |
 | `one-shot` | Measures overhead and LRU pollution without reuse |
 | `hot-key` | Exposes hotspot risk without spillover |
 
 Start with low concurrency to prove cache behavior, then use a concurrency
 ladder appropriate for the deployed capacity. Short output lengths emphasize
-Prefill and TTFT. For legacy generated workloads, `prefix-words` is only an
-approximation; always report actual server `prompt_tokens` from results.
+Prefill and TTFT for locality profiles. The active-token lifecycle profile is
+the deliberate exception: it uses longer output and fewer Proxy-visible
+Decoders to retain completed Prefills in the wait-for-first-Decoder-chunk
+phase. For legacy generated workloads, `prefix-words` is only an approximation;
+always report actual server `prompt_tokens` from results.
 
 The preferred runner uses the checked-in profiles under `benchmarks/profiles/`
 instead of the legacy `prefix-words` generator. See

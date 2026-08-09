@@ -15,7 +15,7 @@ in this directory alongside the checked-in workload profiles.
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
-| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, continuous Poisson overlap at 8/16/24/32 QPS, concurrency 128 | A/B Prefill active-token load balancing |
+| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, 4/8/16/24 QPS, concurrency 192, 256-token outputs, Proxy uses 2 Decoders | Targeted A/B Prefill active-token lifecycle validation |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -108,27 +108,97 @@ every request has a unique prompt, session headers are disabled, and the
 primary comparison is Prefill queue time, TTFT tail latency and per-node load
 balance.
 
-The workload cycles through three prompt-size classes (512, 2,048 and 4,096
-system tokens, with correspondingly different user inputs) while requests
-arrive according to deterministic Poisson offsets:
+#### Lifecycle that creates an A/B routing difference
+
+For a Prefiller, let `Q` be the score of requests whose Prefill RPC is still
+running, and let `W` be the score of requests whose Prefill has completed but
+whose Decoder has not returned its first response chunk. Because Prefill KV is
+reserved across both phases, `active_kv_cache = Q + W`.
+
+The effective priorities are:
+
+```text
+A (baseline)      = 0.3 * (Q + W)
+B (candidate-off) = Q + 0.3 * (Q + W)
+                  = 1.3Q + 0.3W
+```
+
+The baseline source retains the `active_tokens + 0.3 * active_kv_cache`
+formula, but never charges `active_tokens` on a Prefiller, so its effective
+value is the A formula above. The candidate charges both fields when Prefill
+is selected, releases `active_tokens` when Prefill completes, and retains
+`active_kv_cache` until the Decoder produces its first chunk.
+
+If almost every outstanding request is still in Prefill (`W` is near zero),
+A computes `0.3Q` and B computes `1.3Q`. That is only a constant scale factor,
+so both heaps rank the Prefillers in the same order. Merely creating more
+overlapping Prefill work therefore does not exercise the behavioral change.
+The nodes must have different lifecycle mixtures. For example:
+
+| Prefiller | Running Prefill `Q` | Waiting for Decoder `W` | A priority | B priority |
+| --------- | ------------------: | ----------------------: | ---------: | ---------: |
+| P0 | 4,000 | 0 | 1,200 | 5,200 |
+| P1 | 0 | 8,000 | 2,400 | 2,400 |
+
+A selects P0 while B selects P1. More generally, this two-node example
+diverges when `Q0 < W1 < 4.33 * Q0`.
+
+#### Why the previous profile showed little difference
+
+The previous version used four routed Decoders, `max_tokens=4`, concurrency
+128, and sustained 8/16/24/32 QPS Prefill traffic. The deployment allows up to
+64 sequences per Decoder, so its nominal Decode concurrency was 256. Four-token
+responses released Decoders quickly, and a completed Prefill normally moved
+through the `W` phase before the next one-second health sample. Meanwhile the
+high input rate kept many requests in `Q` on every Prefiller.
+
+That workload successfully created Prefill overlap, but usually created one
+of two low-information states:
+
+- `W` was close to zero, making B a constant rescaling of A; or
+- every Prefiller had a similar `Q/W` ratio, preserving the same ordering.
+
+Long steady Poisson stages also average the short/medium/long request mix over
+all four Prefillers. Aggregate request/token CV can consequently look the same
+even if a small number of transient decisions differ. This is why increasing
+QPS and prompt length alone did not produce a clear A/B result.
+
+#### Quick-validation pressure model
+
+The revised profile keeps the three unique prompt-size classes (512, 2,048
+and 4,096 system tokens, with correspondingly different user inputs), but uses
+the following diagnostic configuration:
 
 | Stage | Target rate | Duration | Concurrency |
 | ----- | ----------- | -------- | ----------- |
-| `qps-8` | 8 req/s | 45 s | 128 |
-| `qps-16` | 16 req/s | 45 s | 128 |
-| `qps-24` | 24 req/s | 45 s | 128 |
-| `qps-32` | 32 req/s | 45 s | 128 |
+| `qps-4` | 4 req/s | 5 s | 192 |
+| `qps-8` | 8 req/s | 5 s | 192 |
+| `qps-16` | 16 req/s | 5 s | 192 |
+| `qps-24` | 24 req/s | 5 s | 192 |
 
-With the checked-in seed, these stages generate 352, 690, 1,041 and 1,491
-requests respectively (3,574 total). The longer stages provide enough samples
-to distinguish a repeatable change from normal run-to-run noise. The 32 QPS
-stage adds a stronger overlap point, and four-token outputs keep the profile
-focused on Prefill rather than Decode. The exact count is deterministic, while
-the inter-arrival offsets remain Poisson-distributed within each stage.
+The profile sets `max_tokens=256`, tells the Proxy to route to Decoder 0 and 1,
+and raises the client concurrency ceiling to 192. All four Decoder Pods stay
+running with their normal `MAX_NUM_SEQS=64`; only the Proxy backend list is
+reduced, so no Decoder restart is required. The A/B/C groups use the same two
+Decoders.
 
-The profile contains 8,995,072 input tokens per group (26,985,216 across
-A/B/C). Workload construction verifies unique text against the served
-tokenizer with 16 concurrent workers by default. Set
+Longer outputs do not extend their own Prefiller KV reservation: that
+reservation is released on the first Decoder chunk. Instead, the longer-lived
+Decode requests occupy the two visible Decoders and make later requests wait
+longer before their first chunk. Those later requests remain in `W`, while
+heterogeneous prompts keep other requests in `Q`. Reducing the early QPS stages
+also avoids immediately turning every Prefiller into the same saturated-Q
+state.
+
+Health sampling is reduced from one second to 100 ms because the relevant
+phase transition is transient. With the checked-in seed, the stages generate
+24, 29, 74 and 132 requests respectively (259 total), containing 654,080
+input tokens per group. The short stages make this a quick mechanism check;
+extend their duration and repeat the A/B order when a high-pressure stage first
+shows a useful separation. The exact counts and offsets remain deterministic.
+
+Workload construction verifies unique text against the served tokenizer with
+16 concurrent workers by default. Set
 `TOKENIZER_CONCURRENCY=1` to serialize generation or lower the value if the
 tokenizer endpoint is resource constrained.
 
@@ -146,12 +216,52 @@ bash benchmarks/run_abc_experiment.sh \
   benchmarks/profiles/load-balance-active-tokens.json
 ```
 
+`run_abc_experiment.sh` reads `deployment.proxy_decoder_count` and
+`observability.sample_interval_s` from this profile. Profiles without those
+fields use four Decoders and one-second sampling, so `session-affinity.json`
+and `shared-prefix-capacity.json` retain the normal 4P4D topology. For an
+explicit override, set `BENCHMARK_DECODER_COUNT` or `SAMPLE_INTERVAL`; the
+override is applied identically to A/B/C.
+
 Compare A and B by stage, focusing on Prefill queue time, TTFT p95/p99 and
 `prefill_backend_balance` in each summary. Candidate health samples also expose
 the instantaneous `active_tokens`, `active_kv_cache`, priority and selection
 count for every Prefiller. Do not use cache-hit rate as the success metric;
 near-zero hits are expected because every prompt is unique. B and C should be
 close because this profile intentionally supplies no affinity key.
+
+Before interpreting latency, verify that the workload actually created the
+required lifecycle mixture:
+
+```bash
+jq '.proxy_prefill_load_balance_measurement | {
+  lifecycle_samples,
+  lifecycle_overlap_sample_rate,
+  lifecycle_skew_sample_rate,
+  shadow_heap_divergence_sample_rate,
+  active_tokens_total_p50,
+  estimated_waiting_kv_total_p50
+}' results/runs/<timestamp>-abc/candidate-off/summary.json
+```
+
+`estimated_waiting_kv_total_p50` uses `max(active_kv_cache-active_tokens, 0)`;
+this is valid for this proxy path because it reserves equal compute and KV
+scores for each request. Lifecycle rates use only samples with non-zero
+Prefiller KV load. `lifecycle_overlap_sample_rate` reports loaded snapshots
+containing both running Prefill and waiting-KV work. `lifecycle_skew_sample_rate`
+requires at least two loaded Prefillers to have different `Q/(Q+W)` ratios.
+`shadow_heap_divergence_sample_rate` is the strongest quick check: for each
+sample it computes the baseline and candidate heap choices from the same
+candidate state and reports how often their selected Prefiller differs. It is
+a sampled counterfactual, not the actual cross-run route difference, but a
+zero value means the profile still did not expose the intended scoring choice.
+
+This is a mechanism-validation topology, not the final production claim. If
+it produces a repeatable A/B difference, rerun the comparison with
+`BENCHMARK_DECODER_COUNT=4` on the normal 4P4D topology. A difference only in
+the two-Decoder run proves that the lifecycle signal can affect routing under
+Decode backpressure; it does not prove a material benefit in the production
+capacity ratio.
 
 ### `shared-prefix-capacity.json`
 

@@ -150,6 +150,7 @@ def test_healthcheck_exposes_prefiller_load_and_selection_counts():
     assert selected == {
         "host": "127.0.0.1",
         "port": 8100,
+        "ordinal": 0,
         "active_tokens": 100.0,
         "active_kv_cache": 200.0,
         "priority": 160.0,

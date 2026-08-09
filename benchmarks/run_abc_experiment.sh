@@ -50,6 +50,18 @@ profile_concurrency="$("${PYTHON_BIN}" -c \
   'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("load", {}).get("concurrency", 64))' \
   "${PROFILE}")"
 concurrency="${CONCURRENCY:-${profile_concurrency}}"
+read -r profile_decoder_count profile_sample_interval <<<"$("${PYTHON_BIN}" -c \
+  'import json, sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(p.get("deployment", {}).get("proxy_decoder_count", 4), p.get("observability", {}).get("sample_interval_s", 1.0))' \
+  "${PROFILE}")"
+decoder_count="${BENCHMARK_DECODER_COUNT:-${profile_decoder_count}}"
+sample_interval="${SAMPLE_INTERVAL:-${profile_sample_interval}}"
+case "${decoder_count}" in
+  1|2|3|4) ;;
+  *)
+    echo "BENCHMARK_DECODER_COUNT/profile deployment.proxy_decoder_count must be 1, 2, 3, or 4" >&2
+    exit 2
+    ;;
+esac
 workload_override_args=()
 if [[ -n "${SYSTEM_PROMPT_TOKENS:-}" ]]; then
   workload_override_args=(--system-prompt-tokens "${SYSTEM_PROMPT_TOKENS}")
@@ -72,7 +84,7 @@ for expected_group in baseline candidate-off candidate-on; do
   fi
 done
 
-log "A/B/C experiment started: mode=${EXECUTION_MODE} profile=${PROFILE} output=${experiment_dir}"
+log "A/B/C experiment started: mode=${EXECUTION_MODE} profile=${PROFILE} decoder_count=${decoder_count} concurrency=${concurrency} sample_interval=${sample_interval}s output=${experiment_dir}"
 
 run_local() {
   : "${BASE_URL:?BASE_URL is required in local mode}"
@@ -96,7 +108,8 @@ run_local() {
     WORKLOAD_FILE="${workload_file}" \
     OUTPUT_DIR="${experiment_dir}/${group}" \
     CONCURRENCY="${concurrency}" \
-      bash "${SCRIPT_DIR}/run_experiment.sh" "${group}" "$@"
+    PROXY_DECODER_COUNT="${decoder_count}" \
+      bash "${SCRIPT_DIR}/run_experiment.sh" "${group}" --sample-interval "${sample_interval}" "$@"
     log "completed group=${group}"
   done
 
@@ -128,8 +141,8 @@ deploy_proxy_group() {
       return 2
       ;;
   esac
-  log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware}"
-  PROXY_VARIANT="${proxy_variant}" KV_AWARE_ROUTING="${kv_aware}" \
+  log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware} decoder_count=${decoder_count}"
+  PROXY_VARIANT="${proxy_variant}" KV_AWARE_ROUTING="${kv_aware}" PROXY_DECODER_COUNT="${decoder_count}" \
     bash "${DEPLOY_DIR}/deploy.sh" proxy
 }
 
@@ -151,8 +164,10 @@ run_in_pod() {
     backend_args+=(
       --prefill-base-url "http://pd-prefill-${index}.pd-prefill:7100"
       --prefill-metrics-url "http://pd-prefill-${index}.pd-prefill:7100/metrics"
-      --decode-metrics-url "http://pd-decode-${index}.pd-decode:7200/metrics"
     )
+  done
+  for ((index = 0; index < decoder_count; index++)); do
+    backend_args+=(--decode-metrics-url "http://pd-decode-${index}.pd-decode:7200/metrics")
   done
 
   on_exit() {
@@ -217,6 +232,8 @@ run_in_pod() {
       --workload-file "${workload_file}"
       --output-dir "/results/${group}"
       --concurrency "${concurrency}"
+      --sample-interval "${sample_interval}"
+      --expected-decode-count "${decoder_count}"
       --system-warmup-requests "${SYSTEM_WARMUP_REQUESTS:-8}"
       --label "${group}"
       --reset-before

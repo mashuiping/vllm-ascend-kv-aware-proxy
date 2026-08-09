@@ -149,12 +149,13 @@ def test_health_summary_can_exclude_cache_fill_samples(tmp_path: Path):
         {
             "timestamp": 1.0,
             "kind": "proxy_health",
-            "value": {"prefix_affinity_stats": {"lookups": 10, "hits": 2}},
+            "value": {"decode_instances": 2, "prefix_affinity_stats": {"lookups": 10, "hits": 2}},
         },
         {
             "timestamp": 2.0,
             "kind": "proxy_health",
             "value": {
+                "decode_instances": 2,
                 "prefix_affinity_stats": {"lookups": 100, "hits": 50},
                 "prefill_loads": {
                     "p0": {"priority": 10, "selections": 20},
@@ -166,6 +167,7 @@ def test_health_summary_can_exclude_cache_fill_samples(tmp_path: Path):
             "timestamp": 3.0,
             "kind": "proxy_health",
             "value": {
+                "decode_instances": 2,
                 "prefix_affinity_stats": {"lookups": 112, "hits": 59},
                 "prefill_loads": {
                     "p0": {"priority": 12, "selections": 26},
@@ -183,6 +185,68 @@ def test_health_summary_can_exclude_cache_fill_samples(tmp_path: Path):
     assert summary["prefix_affinity_stats_delta"]["derived_prefix_hit_rate"] == 0.75
     assert summary["selection_count_delta"] == {"p0": 6, "p1": 4}
     assert summary["selection_count_cv"] == pytest.approx(0.2)
+    assert summary["decode_instance_count_min"] == 2
+    assert summary["decode_instance_count_max"] == 2
+
+
+def test_health_summary_exposes_active_token_lifecycle_divergence(tmp_path: Path):
+    samples = tmp_path / "samples.jsonl"
+    records = [
+        {
+            "timestamp": 1.0,
+            "kind": "proxy_health",
+            "value": {
+                "prefill_loads": {
+                    "p0": {
+                        "ordinal": 0,
+                        "active_tokens": 4000,
+                        "active_kv_cache": 4000,
+                        "priority": 5200,
+                        "selections": 1,
+                    },
+                    "p1": {
+                        "ordinal": 1,
+                        "active_tokens": 0,
+                        "active_kv_cache": 8000,
+                        "priority": 2400,
+                        "selections": 1,
+                    },
+                }
+            },
+        },
+        {
+            "timestamp": 2.0,
+            "kind": "proxy_health",
+            "value": {
+                "prefill_loads": {
+                    "p0": {
+                        "ordinal": 0,
+                        "active_tokens": 4000,
+                        "active_kv_cache": 4000,
+                        "priority": 5200,
+                        "selections": 2,
+                    },
+                    "p1": {
+                        "ordinal": 1,
+                        "active_tokens": 8000,
+                        "active_kv_cache": 8000,
+                        "priority": 10400,
+                        "selections": 2,
+                    },
+                }
+            },
+        },
+    ]
+    samples.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+
+    summary = benchmark.summarize_health_samples(samples)
+
+    assert summary["active_tokens_total_p50"] == 8000
+    assert summary["active_kv_cache_total_p50"] == 12000
+    assert summary["estimated_waiting_kv_total_p50"] == 4000
+    assert summary["lifecycle_overlap_sample_rate"] == 0.5
+    assert summary["lifecycle_skew_sample_rate"] == 0.5
+    assert summary["shadow_heap_divergence_sample_rate"] == 0.5
 
 
 def test_verify_reset_across_prefills_primes_checks_and_cleans(tmp_path: Path, monkeypatch):
