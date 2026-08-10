@@ -40,12 +40,12 @@
       {
         "name": "at-knee-qps-3",
         "rate": 3,
-        "duration": 30
+        "duration": 60
       },
       {
         "name": "above-knee-qps-4.5",
         "rate": 4.5,
-        "duration": 30
+        "duration": 90
       }
     ]
   },

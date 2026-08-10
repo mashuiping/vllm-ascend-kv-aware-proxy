@@ -1301,9 +1301,10 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def nested_number(value: dict[str, Any], path: str) -> float | None:
+def nested_number(value: dict[str, Any], path: str | tuple[str, ...]) -> float | None:
     current: Any = value
-    for part in path.split("."):
+    parts = path.split(".") if isinstance(path, str) else path
+    for part in parts:
         if not isinstance(current, dict) or part not in current:
             return None
         current = current[part]
@@ -1311,7 +1312,7 @@ def nested_number(value: dict[str, Any], path: str) -> float | None:
 
 
 def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> dict[str, Any]:
-    paths = [
+    paths: list[str | tuple[str, ...]] = [
         "warm_turns.ttft_ms.p50",
         "warm_turns.ttft_ms.p95",
         "warm_turns.ttft_ms.p99",
@@ -1340,15 +1341,30 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
     for stage in sorted(baseline_stages & treatment_stages):
         paths.extend(
             [
-                f"per_stage.{stage}.ttft_ms.p95",
-                f"per_stage.{stage}.e2e_ms.p95",
-                f"per_stage.{stage}.cached_token_request_rate",
-                f"per_stage.{stage}.cached_token_ratio",
-                f"per_stage.{stage}.client_computed_tokens.mean",
-                f"per_stage.{stage}.request_throughput_per_second",
-                (f"per_stage_metrics_delta_by_role.{stage}.prefill.derived:mean:vllm:request_prefill_time_seconds"),
-                (f"per_stage_metrics_delta_by_role.{stage}.prefill.derived:mean:vllm:request_queue_time_seconds"),
-                (f"per_stage_metrics_delta_by_role.{stage}.decode.derived:mean:vllm:request_queue_time_seconds"),
+                ("per_stage", stage, "ttft_ms", "p95"),
+                ("per_stage", stage, "e2e_ms", "p95"),
+                ("per_stage", stage, "cached_token_request_rate"),
+                ("per_stage", stage, "cached_token_ratio"),
+                ("per_stage", stage, "client_computed_tokens", "mean"),
+                ("per_stage", stage, "request_throughput_per_second"),
+                (
+                    "per_stage_metrics_delta_by_role",
+                    stage,
+                    "prefill",
+                    "derived:mean:vllm:request_prefill_time_seconds",
+                ),
+                (
+                    "per_stage_metrics_delta_by_role",
+                    stage,
+                    "prefill",
+                    "derived:mean:vllm:request_queue_time_seconds",
+                ),
+                (
+                    "per_stage_metrics_delta_by_role",
+                    stage,
+                    "decode",
+                    "derived:mean:vllm:request_queue_time_seconds",
+                ),
             ]
         )
     comparison: dict[str, Any] = {}
@@ -1364,6 +1380,7 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
         "spillover_rate",
     )
     for path in paths:
+        output_path = path if isinstance(path, str) else ".".join(path)
         before = nested_number(baseline, path)
         after = nested_number(treatment, path)
         if before is None or after is None:
@@ -1375,10 +1392,10 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
             relative_change = (after - before) / before
             improvement = (
                 (before - after) / before
-                if any(name in path for name in lower_is_better)
+                if any(name in output_path for name in lower_is_better)
                 else (after - before) / before
             )
-        comparison[path] = {
+        comparison[output_path] = {
             "baseline": before,
             "treatment": after,
             "relative_change": relative_change,

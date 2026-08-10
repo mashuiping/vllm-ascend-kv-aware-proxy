@@ -119,6 +119,32 @@ def test_compare_summaries_includes_shared_prefix_stage_metrics():
     )
 
 
+def test_compare_summaries_preserves_stage_names_with_decimal_points():
+    stage = "above-knee-qps-4.5"
+    baseline = {
+        "per_stage": {stage: {"ttft_ms": {"p95": 200.0}}},
+        "per_stage_metrics_delta_by_role": {
+            stage: {"prefill": {"derived:mean:vllm:request_prefill_time_seconds": 4.0}}
+        },
+    }
+    treatment = {
+        "per_stage": {stage: {"ttft_ms": {"p95": 150.0}}},
+        "per_stage_metrics_delta_by_role": {
+            stage: {"prefill": {"derived:mean:vllm:request_prefill_time_seconds": 3.0}}
+        },
+    }
+
+    comparison = benchmark.compare_summaries(baseline, treatment)
+
+    assert comparison[f"per_stage.{stage}.ttft_ms.p95"]["improvement"] == 0.25
+    assert (
+        comparison[f"per_stage_metrics_delta_by_role.{stage}.prefill.derived:mean:vllm:request_prefill_time_seconds"][
+            "improvement"
+        ]
+        == 0.25
+    )
+
+
 def test_parse_prometheus_aggregates_backends_and_ignores_unrelated_metrics():
     parsed = benchmark.parse_prometheus(
         """

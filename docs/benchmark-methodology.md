@@ -20,6 +20,12 @@ active-token weight 0, and C is candidate with active-token weight 1; affinity
 is disabled in both candidate groups. B versus C therefore isolates only the
 restored Prefill compute-load signal.
 
+The formal mechanism-validation profile runs its 2/3/4.5 QPS stages for
+30/60/90 seconds with two Proxy-visible Decoders and 256-token outputs. The
+unequal durations retain a low-pressure negative control while concentrating
+samples in the informative above-knee stage. This is a deliberately amplified
+lifecycle topology, not a production-capacity claim.
+
 ## Control variables
 
 - Keep P/D Pods, model, image, scheduler arguments and hardware unchanged
@@ -33,7 +39,9 @@ restored Prefill compute-load signal.
 - Within one A/B/C experiment, use identical prompts, seed, session IDs and
   concurrency for all three groups. Across repetitions, rotate the workload
   seed so conclusions do not depend on one deterministic request sequence.
-- Cover all six group-order permutations across the first six repetitions.
+- Start with the cyclic Latin-square orders A/B/C, B/C/A and C/A/B using three
+  distinct seeds. If the effect is not already decisive, add the reverse orders
+  A/C/B, C/B/A and B/A/C with three more distinct seeds.
 - Record warm-up separately from measured requests.
 - Generate one immutable workload and use its SHA-256 in every A/B/C group.
 - Verify the mounted proxy source SHA-256, variant, active-token weight and

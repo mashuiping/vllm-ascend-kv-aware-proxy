@@ -15,7 +15,7 @@ in this directory alongside the checked-in workload profiles.
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
-| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, 2/3/4.5 QPS for 30 seconds each, concurrency 192, 256-token outputs, Proxy uses 2 Decoders | Targeted Prefill active-token lifecycle validation around the measured capacity knee |
+| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, 2/3/4.5 QPS for 30/60/90 seconds, concurrency 192, 256-token outputs, Proxy uses 2 Decoders | Targeted Prefill active-token lifecycle validation around the measured capacity knee |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -108,7 +108,7 @@ every request has a unique prompt, session headers are disabled, and the
 primary comparison is Prefill queue time, TTFT tail latency and per-node load
 balance.
 
-#### Lifecycle that creates an A/B routing difference
+#### Lifecycle that creates a B/C routing difference
 
 For a Prefiller, let `Q` be the score of requests whose Prefill RPC is still
 running, and let `W` be the score of requests whose Prefill has completed but
@@ -132,17 +132,17 @@ is selected, releases `active_tokens` when Prefill completes, and retains
 `active_kv_cache` until the Decoder produces its first chunk.
 
 If almost every outstanding request is still in Prefill (`W` is near zero),
-A computes `0.3Q` and B computes `1.3Q`. That is only a constant scale factor,
+B computes `0.3Q` and C computes `1.3Q`. That is only a constant scale factor,
 so both heaps rank the Prefillers in the same order. Merely creating more
 overlapping Prefill work therefore does not exercise the behavioral change.
 The nodes must have different lifecycle mixtures. For example:
 
-| Prefiller | Running Prefill `Q` | Waiting for Decoder `W` | A priority | B priority |
+| Prefiller | Running Prefill `Q` | Waiting for Decoder `W` | B priority | C priority |
 | --------- | ------------------: | ----------------------: | ---------: | ---------: |
 | P0 | 4,000 | 0 | 1,200 | 5,200 |
 | P1 | 0 | 8,000 | 2,400 | 2,400 |
 
-A selects P0 while B selects P1. More generally, this two-node example
+A/B select P0 while C selects P1. More generally, this two-node example
 diverges when `Q0 < W1 < 4.33 * Q0`.
 
 #### Why the previous profile showed little difference
@@ -171,11 +171,11 @@ The revised profile keeps the three unique prompt-size classes (512, 2,048
 and 4,096 system tokens, with correspondingly different user inputs), but uses
 the following diagnostic configuration:
 
-| Stage | Target rate | Duration | Concurrency |
-| ----- | ----------- | -------- | ----------- |
-| `below-knee-qps-2` | 2 req/s | 30 s | 192 |
-| `at-knee-qps-3` | 3 req/s | 30 s | 192 |
-| `above-knee-qps-4.5` | 4.5 req/s | 30 s | 192 |
+| Stage | Target rate | Duration | Expected requests | Concurrency |
+| ----- | ----------- | -------- | ----------------- | ----------- |
+| `below-knee-qps-2` | 2 req/s | 30 s | about 60 | 192 |
+| `at-knee-qps-3` | 3 req/s | 60 s | about 180 | 192 |
+| `above-knee-qps-4.5` | 4.5 req/s | 90 s | about 405 | 192 |
 
 The profile sets `max_tokens=256`, tells the Proxy to route to Decoder 0 and 1,
 and raises the client concurrency ceiling to 192. All four Decoder Pods stay
@@ -192,8 +192,11 @@ also avoids immediately turning every Prefiller into the same saturated-Q
 state.
 
 Health sampling is reduced from one second to 100 ms because the relevant
-phase transition is transient. Each stage now runs for 30 seconds near the
-observed two-Decoder capacity knee. The runner drains the stage before starting
+phase transition is transient. The initial mechanism-validation run showed the
+expected routing divergence only near and above the capacity knee, so the
+formal profile spends 30/60/90 seconds below/at/above the knee respectively.
+This preserves a low-pressure negative control while concentrating tail samples
+in the informative 4.5 QPS stage. The runner drains the stage before starting
 the next one and records independent per-stage engine-counter snapshots,
 launch span, drain time and total wall time.
 
@@ -619,22 +622,23 @@ GROUP_ORDER='candidate-off candidate-on baseline' \
   bash benchmarks/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
-At least six repetitions should cover the six A/B/C permutations. For normal
-profiles, B versus C isolates affinity. For `load-balance`, automatic
-`active-token` mode makes A exact upstream, B candidate weight=0 and C
-candidate weight=1; B versus C then isolates the active-token lifecycle.
+For normal profiles, B versus C isolates affinity. For `load-balance`,
+automatic `active-token` mode makes A exact upstream, B candidate weight=0 and
+C candidate weight=1; B versus C then isolates the active-token lifecycle.
 Set a different integer `WORKLOAD_SEED` on every repetition; it overrides only
 the generated workload and is recorded in `metadata.json` and the workload
-manifest. A balanced six-run design is:
+manifest. Start with the first three cyclic Latin-square rows below so every
+group occupies each execution position once. If the result is not decisive or
+needs full six-order evidence, run the remaining three reverse rows:
 
 | Run | `GROUP_ORDER` | Example `WORKLOAD_SEED` |
 | --- | --- | --- |
 | 1 | `baseline candidate-off candidate-on` | `202608101` |
-| 2 | `baseline candidate-on candidate-off` | `202608102` |
-| 3 | `candidate-off baseline candidate-on` | `202608103` |
-| 4 | `candidate-off candidate-on baseline` | `202608104` |
-| 5 | `candidate-on baseline candidate-off` | `202608105` |
-| 6 | `candidate-on candidate-off baseline` | `202608106` |
+| 2 | `candidate-off candidate-on baseline` | `202608102` |
+| 3 | `candidate-on baseline candidate-off` | `202608103` |
+| 4 | `baseline candidate-on candidate-off` | `202608104` |
+| 5 | `candidate-on candidate-off baseline` | `202608105` |
+| 6 | `candidate-off baseline candidate-on` | `202608106` |
 
 Every Pod-mode group records `proxy-identity.json` containing the expected and
 actual source SHA-256, variant, active-token weight, KV-aware flag, Pod UID and
