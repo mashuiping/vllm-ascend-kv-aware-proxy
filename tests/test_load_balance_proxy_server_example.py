@@ -24,31 +24,54 @@ def make_scheduler(**kwargs):
 
 def test_extract_session_key_supports_common_stable_fields():
     header_cases = [
+        ("X-Session-Affinity", "session"),
+        ("Thread-ID", "session"),
+        ("X-OpenCode-Session", "session"),
+        ("X-Task-ID", "session"),
+        ("X-Roo-Task-ID", "session"),
         ("X-Session-ID", "session"),
+        ("Session-ID", "session"),
+        ("session_id", "session"),
         ("X-Claude-Code-Session-ID", "claude"),
     ]
     for name, value in header_cases:
-        assert proxy.extract_session_key({name: value}, {}) == f"header:{name.lower()}:{value}"
+        assert proxy.extract_session_key({name: value}, {}) == proxy._normalized_session_key(value)
 
     headers = {
         "X-Session-ID": "session",
         "X-Claude-Code-Session-ID": "claude",
     }
-    assert proxy.extract_session_key(headers, {}) == "header:x-session-id:session"
-    assert proxy.extract_session_key(headers, {"session_id": "body"}) == "header:x-session-id:session"
+    assert proxy.extract_session_key(headers, {}) == proxy._normalized_session_key("claude")
+    assert proxy.extract_session_key(headers, {"session_id": "body"}) == proxy._normalized_session_key("claude")
 
     body_cases = [
-        ({"session_params": {"session_id": "nested"}}, "body:session_params.session_id:nested"),
-        ({"session_id": "session"}, "body:session_id:session"),
+        {"session_params": {"session_id": "nested"}},
+        {"session_id": "session"},
+        {"sessionId": "session"},
+        {"task_id": "session"},
+        {"taskId": "session"},
+        {"request": {"session_id": "session"}},
     ]
-    for body, expected in body_cases:
-        assert proxy.extract_session_key({}, body) == expected
+    for body in body_cases:
+        value = next(
+            value
+            for value in (
+                body.get("session_id"),
+                body.get("sessionId"),
+                body.get("task_id"),
+                body.get("taskId"),
+                (body.get("session_params") or {}).get("session_id"),
+                (body.get("request") or {}).get("session_id"),
+            )
+            if value is not None
+        )
+        assert proxy.extract_session_key({}, body) == proxy._normalized_session_key(value)
 
     conflicting_body = {
         "session_id": "primary",
         "session_params": {"session_id": "secondary"},
     }
-    assert proxy.extract_session_key({}, conflicting_body) == "body:session_id:primary"
+    assert proxy.extract_session_key({}, conflicting_body) == proxy._normalized_session_key("primary")
     ignored_identifiers = [
         ({"X-User-ID": "user"}, {}),
         ({"X-Tenant-ID": "tenant"}, {}),
@@ -60,6 +83,40 @@ def test_extract_session_key_supports_common_stable_fields():
     ]
     for ignored_headers, ignored_body in ignored_identifiers:
         assert proxy.extract_session_key(ignored_headers, ignored_body) is None
+
+
+def test_extract_session_key_uses_tool_specific_precedence_and_aliases(caplog):
+    generic_aliases = [
+        {"X-Session-ID": "same"},
+        {"Session-ID": "same"},
+        {"session_id": "same"},
+    ]
+    expected = proxy._normalized_session_key("same")
+    assert all(proxy.extract_session_key(headers, {}) == expected for headers in generic_aliases)
+    assert proxy.extract_session_key({}, {"session_id": "same"}) == expected
+
+    codex = {"Session-ID": "client", "Thread-ID": "conversation"}
+    assert proxy.extract_session_key(codex, {}) == proxy._normalized_session_key("conversation")
+
+    claude = {
+        "X-Claude-Code-Session-ID": "conversation",
+        "X-Claude-Code-Agent-ID": "subagent",
+        "X-Claude-Code-Parent-Agent-ID": "parent",
+    }
+    assert proxy.extract_session_key(claude, {}) == proxy._normalized_session_key("conversation", "subagent")
+
+    with caplog.at_level("DEBUG", logger=proxy.logger.name):
+        selected = proxy.extract_session_key(
+            {"X-Session-Affinity": "override", "Thread-ID": "conversation"},
+            {"session_id": "body"},
+        )
+    assert selected == proxy._normalized_session_key("override")
+    assert any("Conflicting affinity identifiers" in record.getMessage() for record in caplog.records)
+
+
+def test_extract_session_key_rejects_oversized_or_structured_values():
+    assert proxy.extract_session_key({"X-Session-ID": "x" * 257}, {}) is None
+    assert proxy.extract_session_key({}, {"session_id": {"nested": "value"}}) is None
 
 
 def test_extract_prefix_key_uses_only_supported_text_requests():
@@ -125,7 +182,7 @@ def test_kv_cache_aware_routing_is_opt_in(monkeypatch):
     assert proxy.extract_affinity_keys(headers, body, enabled=False, prefix_chars=32) == (None, None)
 
     session_key, prefix_key = proxy.extract_affinity_keys(headers, body, enabled=True, prefix_chars=32)
-    assert session_key == "header:x-session-id:session"
+    assert session_key == proxy._normalized_session_key("session")
     assert prefix_key == proxy.extract_prefix_key(body, 32)
 
 
@@ -539,7 +596,7 @@ def test_assign_instances_with_gate_off_binds_even_when_reusable_is_zero(monkeyp
         next(iter(scheduler.decoders)),
         instance_info.decoder_score,
     )
-    assert "header:x-session-id:s1" in scheduler.session_lru or "body:session_id:s1" in scheduler.session_lru
+    assert proxy._normalized_session_key("s1") in scheduler.session_lru
 
 
 def test_assign_instances_with_gate_on_skips_bind_when_reusable_zero(monkeypatch):
@@ -588,7 +645,8 @@ def test_assign_instances_with_gate_on_skips_bind_when_reusable_zero(monkeypatch
     )
     monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
 
-    s_key = "body:session_id:s1"
+    s_key = proxy.extract_session_key({}, {"session_id": "s1"})
+    assert s_key is not None
     instance_info = asyncio.run(
         proxy.assign_instances(
             "/completions",
@@ -649,7 +707,8 @@ def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monk
     )
     monkeypatch.setattr(proxy, "send_request_to_service", lambda client, *a, **kw: client.post())
 
-    s_key = "body:session_id:s1"
+    s_key = proxy.extract_session_key({}, {"session_id": "s1"})
+    assert s_key is not None
     with caplog.at_level("DEBUG", logger=proxy.logger.name):
         instance_info = asyncio.run(
             proxy.assign_instances(

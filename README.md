@@ -33,12 +33,15 @@ stable session key  →  text prefix hash  →  existing load heap
 | **Session affinity** | Explicit session id (headers first, then body) | Multi-turn conversations |
 | **Prefix-hash affinity** | Hash of a canonical text prefix | Cross-session shared system / prompt prefixes |
 
-Session identifiers are matched first-match-wins:
-
-1. `X-Session-ID`
-2. `X-Claude-Code-Session-ID`
-3. top-level JSON `session_id`
-4. JSON `session_params.session_id`
+Session identifiers are matched first-match-wins. The proxy recognizes native
+identifiers from OpenCode, Claude Code, Codex, Pi, Cline, Roo Code, and Gemini
+CLI in addition to generic `X-Session-ID` and JSON fields. Codex `Thread-ID`
+wins over its broader `Session-ID`; Claude Code subagents use a composite of
+session and agent IDs. Equivalent generic aliases normalize to the same bounded
+digest, so changing from a header to a body field does not lose an existing
+binding or retain the original client ID in shared scheduler memory. See the
+[compatibility matrix](docs/design.md#client-compatibility) for exact fields and
+precedence.
 
 Prefix hashing covers string `prompt` values and chat messages with plain-string
 roles and contents. Tool calls, structured content, and multimodal requests skip
@@ -87,6 +90,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Omit `--enable-kv-cache-aware-routing` to keep the candidate proxy with affinity
 disabled.
+
+Prefix cache hits generally require the shared prompt to cover at least one KV
+block. On Ascend the minimum `block_size` is typically 128 tokens, but the exact
+value depends on the model architecture and vLLM configuration—short demo
+prompts like the curl above may not produce a hit.
 
 ## Configuration
 

@@ -176,18 +176,20 @@ class InstanceInfo:
 
 
 TAINT_PRIORITY = 1e15
-# Keep this list session-scoped. User/tenant IDs are intentionally excluded:
-# their wider cardinality can pin unrelated conversations to one Prefiller and
-# create hotspots. Request/trace IDs are also excluded because they change per
-# request and therefore cannot provide affinity.
-#
-# X-Session-ID and session_params.session_id follow the vLLM Router convention:
-# https://github.com/vllm-project/router/blob/main/docs/load_balancing/README.md
-# Claude Code documents X-Claude-Code-Session-ID as stable for one session:
-# https://code.claude.com/docs/en/llm-gateway#request-headers
+SESSION_KEY_VERSION = "pd-session-v2"
+MAX_AFFINITY_ID_BYTES = 256
+# Priority is deliberate: a trusted gateway may explicitly override affinity;
+# a Codex thread is more conversation-specific than its client session; native
+# tool identifiers then win over generic compatibility aliases.
 SESSION_HEADER_NAMES: tuple[str, ...] = (
+    "x-session-affinity",
+    "thread-id",
+    "x-opencode-session",
+    "x-task-id",
+    "x-roo-task-id",
     "x-session-id",
-    "x-claude-code-session-id",
+    "session-id",
+    "session_id",
 )
 PREFIX_HASH_VERSION = "pd-prefix-v1"
 
@@ -235,44 +237,97 @@ def encode_response_chunk(chunk_json: dict, is_sse: bool) -> bytes:
     return b"data: " + chunk + b"\n\n" if is_sse else chunk
 
 
-def _affinity_value(value: Any) -> str | None:
+def _affinity_value(value: Any, *, max_bytes: int | None = None) -> str | None:
     # Container string representations are not a stable cross-client contract
     # and can retain unexpectedly large request fragments in the shared LRU.
     if value is None or isinstance(value, (dict, list, tuple, set)):
         return None
     text = str(value).strip()
-    return text or None
+    if not text or (max_bytes is not None and len(text.encode("utf-8")) > max_bytes):
+        return None
+    return text
+
+
+def _session_value(value: Any) -> str | None:
+    return _affinity_value(value, max_bytes=MAX_AFFINITY_ID_BYTES)
+
+
+def _normalized_session_key(*parts: str) -> str:
+    """Build a bounded key without retaining a client-provided identifier."""
+    payload = json.dumps(
+        [SESSION_KEY_VERSION, *parts],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.blake2s(payload.encode("utf-8"), digest_size=16).hexdigest()
+    return f"session:{SESSION_KEY_VERSION}:{digest}"
+
+
+def _session_candidates(
+    headers: Mapping[str, str] | None,
+    body: Mapping[str, Any] | None,
+) -> list[tuple[str, tuple[str, ...]]]:
+    candidates: list[tuple[str, tuple[str, ...]]] = []
+    lowered = {str(name).lower(): value for name, value in (headers or {}).items()}
+
+    explicit_affinity = _session_value(lowered.get("x-session-affinity"))
+    if explicit_affinity is not None:
+        candidates.append(("header:x-session-affinity", (explicit_affinity,)))
+
+    thread_id = _session_value(lowered.get("thread-id"))
+    if thread_id is not None:
+        candidates.append(("header:thread-id", (thread_id,)))
+
+    claude_session_id = _session_value(lowered.get("x-claude-code-session-id"))
+    if claude_session_id is not None:
+        claude_agent_id = _session_value(lowered.get("x-claude-code-agent-id"))
+        parts = (claude_session_id, claude_agent_id) if claude_agent_id is not None else (claude_session_id,)
+        candidates.append(("header:x-claude-code-session-id", parts))
+
+    for name in SESSION_HEADER_NAMES[2:]:
+        value = _session_value(lowered.get(name))
+        if value is not None:
+            candidates.append((f"header:{name}", (value,)))
+
+    if not body:
+        return candidates
+
+    for name in ("session_id", "sessionId", "task_id", "taskId"):
+        value = _session_value(body.get(name))
+        if value is not None:
+            candidates.append((f"body:{name}", (value,)))
+
+    session_params = body.get("session_params")
+    if isinstance(session_params, Mapping):
+        value = _session_value(session_params.get("session_id"))
+        if value is not None:
+            candidates.append(("body:session_params.session_id", (value,)))
+
+    # Gemini CLI's Code Assist schema nests its stable session UUID here.
+    request = body.get("request")
+    if isinstance(request, Mapping):
+        value = _session_value(request.get("session_id"))
+        if value is not None:
+            candidates.append(("body:request.session_id", (value,)))
+
+    return candidates
 
 
 def extract_session_key(headers: Mapping[str, str] | None, body: Mapping[str, Any] | None) -> str | None:
     """Extract an explicitly session-scoped Prefiller affinity key."""
-    if headers:
-        # Headers are routing metadata and work across request schemas, so they
-        # take precedence over legacy body fields. This also lets a gateway add
-        # affinity without rewriting an OpenAI-compatible JSON payload.
-        lowered = {str(name).lower(): value for name, value in headers.items()}
-        for name in SESSION_HEADER_NAMES:
-            value = _affinity_value(lowered.get(name))
-            if value is not None:
-                return f"header:{name}:{value}"
-
-    if not body:
+    candidates = _session_candidates(headers, body)
+    if not candidates:
         return None
-
-    value = _affinity_value(body.get("session_id"))
-    if value is not None:
-        return f"body:session_id:{value}"
-
-    session_params = body.get("session_params")
-    if isinstance(session_params, Mapping):
-        # vLLM Router documents this nested form for backward compatibility.
-        # Keep it after the explicit top-level session_id field so conflicting
-        # legacy metadata cannot override the caller's selected session.
-        value = _affinity_value(session_params.get("session_id"))
-        if value is not None:
-            return f"body:session_params.session_id:{value}"
-
-    return None
+    source, parts = candidates[0]
+    selected_key = _normalized_session_key(*parts)
+    conflicts = [candidate_source for candidate_source, candidate_parts in candidates[1:] if candidate_parts != parts]
+    if conflicts:
+        logger.debug(
+            "Conflicting affinity identifiers; selected %s over %s",
+            source,
+            ", ".join(conflicts),
+        )
+    return selected_key
 
 
 def _canonical_prefix(body: Mapping[str, Any], prefix_chars: int) -> tuple[str, str] | None:

@@ -13,6 +13,33 @@ LRU state is not persisted. Proxy restart, manual prefix-cache reset, Prefiller
 removal and eviction discard bindings. This affects performance, not request
 correctness: a miss returns to load-based routing and recomputes KV.
 
+## Client identifiers are routing hints, not authentication
+
+All supported affinity fields are client-controlled unless an upstream gateway
+removes and replaces them. A caller can therefore choose a hot key and create a
+localized load hotspot. Restrict direct access, overwrite
+`X-Session-Affinity` at a trusted edge when it is used as an override, and do
+not use an affinity match as an authorization decision.
+
+The proxy hashes identifiers and rejects values larger than 256 UTF-8 bytes,
+but it does not currently include an authenticated tenant namespace or secret
+HMAC in the key. Deployments where unrelated tenants can choose identical IDs
+should add a trusted tenant scope before hashing.
+
+Some HTTP gateways reject or drop underscore-containing header names such as
+`session_id`. They are accepted for Cline/Roo/Pi compatibility, but integrations
+should prefer `Session-ID`, `X-Session-ID`, or `X-Session-Affinity` where they
+control the contract.
+
+## Native identifiers have different scopes
+
+Codex `Thread-ID` is preferred over its broader `Session-ID`. Claude Code
+subagents use the combination of session and agent ID so parallel agents do not
+all share one hot binding. `X-Claude-Code-Parent-Agent-ID` is not a routing key.
+Generic `X-Client-Request-ID`, request IDs, trace IDs, user IDs, and tenant IDs
+are deliberately ignored even though a particular client may sometimes place a
+stable value in one of them.
+
 ## Reusable-prefix gate depends on Prefiller details
 
 `--enable-reusable-prefix-affinity-gate` only takes effect when Prefillers
