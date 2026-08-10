@@ -14,6 +14,12 @@ Use B versus C to isolate affinity. Use A versus B to detect effects from the
 restored Prefiller load lifecycle and other candidate integration changes. Use
 A versus C only as the end-to-end comparison with stock upstream.
 
+The `load-balance` profile is the exception: the orchestrator automatically
+uses active-token isolation mode. A is exact upstream, B is candidate with
+active-token weight 0, and C is candidate with active-token weight 1; affinity
+is disabled in both candidate groups. B versus C therefore isolates only the
+restored Prefill compute-load signal.
+
 ## Control variables
 
 - Keep P/D Pods, model, image, scheduler arguments and hardware unchanged
@@ -24,12 +30,18 @@ A versus C only as the end-to-end comparison with stock upstream.
 - Restart only the proxy between groups by default.
 - Drain all Prefillers, reset backend prefix caches and verify every direct
   Prefiller is cold before every measured run.
-- Use identical prompts, seeds, session IDs and concurrency.
-- Alternate group order across repetitions instead of always running A/B/C.
+- Within one A/B/C experiment, use identical prompts, seed, session IDs and
+  concurrency for all three groups. Across repetitions, rotate the workload
+  seed so conclusions do not depend on one deterministic request sequence.
+- Cover all six group-order permutations across the first six repetitions.
 - Record warm-up separately from measured requests.
 - Generate one immutable workload and use its SHA-256 in every A/B/C group.
+- Verify the mounted proxy source SHA-256, variant, active-token weight and
+  affinity flag before every group; identity mismatch invalidates the run.
 - Define prompt sizes in model tokens and verify them with the served tokenizer.
 - Run enough repetitions to distinguish a stable effect from normal variance.
+- Use paired differences across repetitions and report a confidence interval,
+  not only averages of per-run p95 values.
 
 At minimum, record the image digest, model identifier, NPU type, CANN and driver
 versions, P/D topology, repository commit, upstream baseline commit, run order,

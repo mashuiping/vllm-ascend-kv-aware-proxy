@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_DIR="${REPO_ROOT}/deploy/kubernetes/qwen3-32b-4p4d-tp2"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+comparison_mode="${ABC_COMPARISON_MODE:-affinity}"
 
 log() {
   printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
@@ -24,14 +25,24 @@ case "${GROUP}" in
   baseline)
     export PROXY_VARIANT=baseline
     export KV_AWARE_ROUTING=false
+    export PROXY_SOURCE_PATH="${BASELINE_PROXY_SOURCE_PATH:-${REPO_ROOT}/baseline/load_balance_proxy_server_example.py}"
     ;;
   candidate-off)
     export PROXY_VARIANT=candidate
     export KV_AWARE_ROUTING=false
+    export PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH:-${REPO_ROOT}/load_balance_proxy_server_example.py}"
+    if [[ "${comparison_mode}" == "active-token" ]]; then
+      export PREFILL_ACTIVE_TOKEN_WEIGHT=0
+    fi
     ;;
   candidate-on)
     export PROXY_VARIANT=candidate
-    export KV_AWARE_ROUTING=true
+    if [[ "${comparison_mode}" == "active-token" ]]; then
+      export KV_AWARE_ROUTING=false
+    else
+      export KV_AWARE_ROUTING=true
+    fi
+    export PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH:-${REPO_ROOT}/load_balance_proxy_server_example.py}"
     ;;
   *)
     echo "unknown group: ${GROUP}; expected baseline, candidate-off, or candidate-on" >&2
@@ -68,7 +79,7 @@ fi
 
 # Only the proxy is restarted. Keeping the P/D topology fixed reduces the
 # number of variables between groups; --reset-before clears prefix caches.
-log "${GROUP}: deploying proxy variant=${PROXY_VARIANT} kv_aware=${KV_AWARE_ROUTING}"
+log "${GROUP}: deploying proxy variant=${PROXY_VARIANT} kv_aware=${KV_AWARE_ROUTING} active_token_weight=${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
 bash "${DEPLOY_DIR}/deploy.sh" proxy
 log "${GROUP}: proxy ready; starting benchmark output=${output_dir}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/benchmark_session_affinity.py" "${benchmark_args[@]}" "$@"

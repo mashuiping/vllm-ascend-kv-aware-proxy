@@ -117,6 +117,11 @@ def parse_args() -> argparse.Namespace:
         help="Direct vLLM server root exposing /tokenize and /detokenize.",
     )
     parser.add_argument("--model", help="Served model name; required with --tokenizer-url.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Override the profile seed for this repetition without editing the profile.",
+    )
     parser.add_argument("--tokenizer-concurrency", type=int, default=16)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -158,6 +163,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     profile = override_system_prompt_tokens(load_profile(args.profile), args.system_prompt_tokens)
+    if args.seed is not None:
+        profile = dict(profile)
+        profile["seed"] = args.seed
     started = time.monotonic()
     print(
         f"[workload] loading profile={args.profile} tokenizer={args.tokenizer_url or 'unverified-smoke'}",

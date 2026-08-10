@@ -128,6 +128,7 @@ import heapq
 import ipaddress
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -441,6 +442,7 @@ class SharedProxyScheduler:
         *,
         session_lru_size: int = 4096,
         prefix_lru_size: int = 1024,
+        prefill_active_token_weight: float = 1.0,
     ):
         self._lock = threading.RLock()
         self.request_num = 0
@@ -452,8 +454,15 @@ class SharedProxyScheduler:
         self._ordinal = 0
         self.session_lru_size = max(0, int(session_lru_size))
         self.prefix_lru_size = max(0, int(prefix_lru_size))
+        self.prefill_active_token_weight = max(0.0, float(prefill_active_token_weight))
         self.session_lru: OrderedDict[str, str] = OrderedDict()
         self.prefix_lru: OrderedDict[str, str] = OrderedDict()
+        self.prefill_routing_stats = {
+            "heap_decisions": 0,
+            "shadow_baseline_active_divergences": 0,
+            "actual_differs_from_baseline": 0,
+            "actual_differs_from_active": 0,
+        }
 
         for host, port in prefiller_instances:
             self._add_server_no_lock(ServerRole.PREFILL, host, port)
@@ -483,7 +492,7 @@ class SharedProxyScheduler:
             # active_tokens is released when Prefill finishes, while KV pressure
             # lasts until Decoder starts consuming the transfer. This restores
             # the two-phase accounting used before the shared-scheduler refactor.
-            return entry.active_tokens + entry.active_kv_cache * 0.3
+            return self.prefill_active_token_weight * entry.active_tokens + entry.active_kv_cache * 0.3
         return entry.active_tokens
 
     def _push_heap(self, role: ServerRole, key: str) -> None:
@@ -553,6 +562,8 @@ class SharedProxyScheduler:
                 "prefill_instances": len(self.prefillers),
                 "decode_instances": len(self.decoders),
                 "request_num": self.request_num,
+                "prefill_active_token_weight": self.prefill_active_token_weight,
+                "prefill_routing_stats": dict(self.prefill_routing_stats),
                 "prefill_loads": {
                     key: {
                         "host": entry.host,
@@ -639,6 +650,22 @@ class SharedProxyScheduler:
             prefiller_key = self._resolve_affinity_no_lock(self.prefix_lru, prefix_key)
         if prefiller_key is None:
             route_source = "heap"
+        baseline_shadow_key = active_shadow_key = None
+        if route_source == "heap":
+            live_prefillers = [
+                (key, entry)
+                for key, entry in self.prefillers.items()
+                if key not in self._pool(ServerRole.PREFILL).tainted
+            ]
+            if live_prefillers:
+                baseline_shadow_key = min(
+                    live_prefillers,
+                    key=lambda item: (0.3 * item[1].active_kv_cache, item[1].ordinal),
+                )[0]
+                active_shadow_key = min(
+                    live_prefillers,
+                    key=lambda item: (item[1].active_tokens + 0.3 * item[1].active_kv_cache, item[1].ordinal),
+                )[0]
         # Reserve both phases through the original scheduler primitive so
         # another request sees the complete cost before making its decision.
         picked = self._pick_server(
@@ -648,6 +675,14 @@ class SharedProxyScheduler:
             kv_cache_load=kv_load,
         )
         picked["route_source"] = route_source
+        if route_source == "heap":
+            self.prefill_routing_stats["heap_decisions"] += 1
+            if baseline_shadow_key is not None and baseline_shadow_key != active_shadow_key:
+                self.prefill_routing_stats["shadow_baseline_active_divergences"] += 1
+            if baseline_shadow_key is not None and picked["key"] != baseline_shadow_key:
+                self.prefill_routing_stats["actual_differs_from_baseline"] += 1
+            if active_shadow_key is not None and picked["key"] != active_shadow_key:
+                self.prefill_routing_stats["actual_differs_from_active"] += 1
         return picked
 
     def _bind_affinity_no_lock(
@@ -1027,6 +1062,15 @@ def parse_args() -> argparse.Namespace:
         help="Log level for the proxy server.",
     )
     parser.add_argument(
+        "--prefill-active-token-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight applied to in-flight Prefill compute load. Set to 0 to retain "
+            "candidate instrumentation while matching the upstream KV-only heap priority."
+        ),
+    )
+    parser.add_argument(
         "--enable-kv-cache-aware-routing",
         action="store_true",
         help="Enable session and text-prefix affinity for Prefiller routing.",
@@ -1071,15 +1115,18 @@ def parse_args() -> argparse.Namespace:
     args.session_lru_size = max(0, args.session_lru_size)
     args.prefix_hash_chars = max(0, args.prefix_hash_chars)
     args.prefix_lru_size = max(0, args.prefix_lru_size)
+    if not math.isfinite(args.prefill_active_token_weight) or args.prefill_active_token_weight < 0:
+        raise ValueError("prefill active-token weight must be finite and non-negative")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
 
 
-def _scheduler_affinity_kwargs(args: argparse.Namespace) -> dict[str, int]:
+def _scheduler_affinity_kwargs(args: argparse.Namespace) -> dict[str, int | float]:
     return {
         "session_lru_size": args.session_lru_size,
         "prefix_lru_size": args.prefix_lru_size,
+        "prefill_active_token_weight": args.prefill_active_token_weight,
     }
 
 

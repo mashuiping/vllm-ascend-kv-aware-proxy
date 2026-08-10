@@ -15,7 +15,7 @@ in this directory alongside the checked-in workload profiles.
 | ----------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
-| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, 4/8/16/24 QPS, concurrency 192, 256-token outputs, Proxy uses 2 Decoders | Targeted A/B Prefill active-token lifecycle validation |
+| `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, 2/3/4.5 QPS for 30 seconds each, concurrency 192, 256-token outputs, Proxy uses 2 Decoders | Targeted Prefill active-token lifecycle validation around the measured capacity knee |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 
@@ -102,8 +102,8 @@ to the runner.
 
 ### `load-balance-active-tokens.json`
 
-This profile is designed to expose the transient Prefill load signal in B
-(`candidate-off`) versus A (`baseline`). It is not a cache-locality test:
+This profile is designed to expose the transient Prefill load signal. It is
+not a cache-locality test:
 every request has a unique prompt, session headers are disabled, and the
 primary comparison is Prefill queue time, TTFT tail latency and per-node load
 balance.
@@ -115,12 +115,14 @@ running, and let `W` be the score of requests whose Prefill has completed but
 whose Decoder has not returned its first response chunk. Because Prefill KV is
 reserved across both phases, `active_kv_cache = Q + W`.
 
-The effective priorities are:
+In the automatically selected `active-token` comparison mode, the effective
+priorities are:
 
 ```text
-A (baseline)      = 0.3 * (Q + W)
-B (candidate-off) = Q + 0.3 * (Q + W)
-                  = 1.3Q + 0.3W
+A (exact upstream)       = 0.3 * (Q + W)
+B (candidate weight=0)  = 0.3 * (Q + W)
+C (candidate weight=1)  = Q + 0.3 * (Q + W)
+                        = 1.3Q + 0.3W
 ```
 
 The baseline source retains the `active_tokens + 0.3 * active_kv_cache`
@@ -163,7 +165,7 @@ all four Prefillers. Aggregate request/token CV can consequently look the same
 even if a small number of transient decisions differ. This is why increasing
 QPS and prompt length alone did not produce a clear A/B result.
 
-#### Quick-validation pressure model
+#### Capacity-knee pressure model
 
 The revised profile keeps the three unique prompt-size classes (512, 2,048
 and 4,096 system tokens, with correspondingly different user inputs), but uses
@@ -171,10 +173,9 @@ the following diagnostic configuration:
 
 | Stage | Target rate | Duration | Concurrency |
 | ----- | ----------- | -------- | ----------- |
-| `qps-4` | 4 req/s | 5 s | 192 |
-| `qps-8` | 8 req/s | 5 s | 192 |
-| `qps-16` | 16 req/s | 5 s | 192 |
-| `qps-24` | 24 req/s | 5 s | 192 |
+| `below-knee-qps-2` | 2 req/s | 30 s | 192 |
+| `at-knee-qps-3` | 3 req/s | 30 s | 192 |
+| `above-knee-qps-4.5` | 4.5 req/s | 30 s | 192 |
 
 The profile sets `max_tokens=256`, tells the Proxy to route to Decoder 0 and 1,
 and raises the client concurrency ceiling to 192. All four Decoder Pods stay
@@ -191,11 +192,10 @@ also avoids immediately turning every Prefiller into the same saturated-Q
 state.
 
 Health sampling is reduced from one second to 100 ms because the relevant
-phase transition is transient. With the checked-in seed, the stages generate
-24, 29, 74 and 132 requests respectively (259 total), containing 654,080
-input tokens per group. The short stages make this a quick mechanism check;
-extend their duration and repeat the A/B order when a high-pressure stage first
-shows a useful separation. The exact counts and offsets remain deterministic.
+phase transition is transient. Each stage now runs for 30 seconds near the
+observed two-Decoder capacity knee. The runner drains the stage before starting
+the next one and records independent per-stage engine-counter snapshots,
+launch span, drain time and total wall time.
 
 Workload construction verifies unique text against the served tokenizer with
 16 concurrent workers by default. Set
@@ -204,10 +204,8 @@ tokenizer endpoint is resource constrained.
 
 The generated system and user messages are unique per request, so cache hits
 should remain negligible. The different prompt sizes create overlapping
-Prefill work; B can then avoid selecting a node whose active Prefill compute
-load is high even when its KV load alone appears low. C is still run by the
-standard A/B/C script, but its affinity result is only a reference for this
-profile.
+Prefill work; candidate weight=1 can then avoid selecting a node whose active
+Prefill compute load is high even when its KV load alone appears low.
 
 Run it with the normal orchestrator:
 
@@ -223,7 +221,9 @@ and `shared-prefix-capacity.json` retain the normal 4P4D topology. For an
 explicit override, set `BENCHMARK_DECODER_COUNT` or `SAMPLE_INTERVAL`; the
 override is applied identically to A/B/C.
 
-Compare A and B by stage, focusing on Prefill queue time, TTFT p95/p99 and
+For this profile the orchestrator automatically uses `active-token` mode:
+exact upstream, candidate weight=0, and candidate weight=1, all with affinity
+disabled. Compare B and C by stage, focusing on Prefill queue time, TTFT p95/p99 and
 `prefill_backend_balance` in each summary. Candidate health samples also expose
 the instantaneous `active_tokens`, `active_kv_cache`, priority and selection
 count for every Prefiller. Do not use cache-hit rate as the success metric;
@@ -619,9 +619,40 @@ GROUP_ORDER='candidate-off candidate-on baseline' \
   bash benchmarks/run_abc_experiment.sh benchmarks/profiles/session-affinity.json
 ```
 
-At least six repetitions should cover the six A/B/C permutations. Treat
-`candidate-off` versus `candidate-on` as the affinity comparison; the upstream
-baseline versus candidate-off comparison measures other candidate changes.
+At least six repetitions should cover the six A/B/C permutations. For normal
+profiles, B versus C isolates affinity. For `load-balance`, automatic
+`active-token` mode makes A exact upstream, B candidate weight=0 and C
+candidate weight=1; B versus C then isolates the active-token lifecycle.
+Set a different integer `WORKLOAD_SEED` on every repetition; it overrides only
+the generated workload and is recorded in `metadata.json` and the workload
+manifest. A balanced six-run design is:
+
+| Run | `GROUP_ORDER` | Example `WORKLOAD_SEED` |
+| --- | --- | --- |
+| 1 | `baseline candidate-off candidate-on` | `202608101` |
+| 2 | `baseline candidate-on candidate-off` | `202608102` |
+| 3 | `candidate-off baseline candidate-on` | `202608103` |
+| 4 | `candidate-off candidate-on baseline` | `202608104` |
+| 5 | `candidate-on baseline candidate-off` | `202608105` |
+| 6 | `candidate-on candidate-off baseline` | `202608106` |
+
+Every Pod-mode group records `proxy-identity.json` containing the expected and
+actual source SHA-256, variant, active-token weight, KV-aware flag, Pod UID and
+image ID. The run aborts before sending traffic if they differ. A global
+`PROXY_SOURCE_PATH` is rejected because it can accidentally make all groups
+run the same source; use `BASELINE_PROXY_SOURCE_PATH` and
+`CANDIDATE_PROXY_SOURCE_PATH` for intentional overrides.
+
+Aggregate valid repetitions with paired bootstrap confidence intervals:
+
+```bash
+python benchmarks/compare_repetitions.py \
+  --comparison B_vs_C \
+  results/runs/<run-1>-abc results/runs/<run-2>-abc results/runs/<run-3>-abc
+```
+
+The aggregate output reports whether all six group orders were covered and
+whether every repetition used a distinct workload seed.
 
 For compatibility, the previous local/port-forward execution path remains
 available:

@@ -4,6 +4,15 @@ Raw runs are written under `results/runs/` and ignored by Git because request
 payloads and logs may be large or sensitive. Publish only reviewed and redacted
 artifacts under `results/published/<experiment-id>/`.
 
+## Known invalid local runs
+
+The six `20260810T002611Z-abc` through `20260810T010902Z-abc` runs are invalid.
+Their A-group health samples contain candidate-only `prefill_loads` and
+`active_tokens` fields, proving that the declared exact baseline source was not
+mounted. They must not be used for performance claims. New Pod-mode runs verify
+the mounted proxy SHA-256, variant, active-token weight and affinity flag before
+sending traffic.
+
 Every published experiment should contain:
 
 ```text

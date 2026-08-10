@@ -25,6 +25,7 @@ spec:
         app.kubernetes.io/name: pd-proxy
       annotations:
         pd.openai.com/restarted-at: "__RESTART_TOKEN__"
+        pd.openai.com/proxy-code-sha256: "__PROXY_CODE_SHA256__"
     spec:
       nodeName: "__PREFILL_NODE__"
       containers:
@@ -36,11 +37,13 @@ spec:
             - /opt/pd-launcher/launch_proxy.sh
           env:
             - {name: PROXY_VARIANT, value: "__PROXY_VARIANT__"}
+            - {name: PROXY_CODE_SHA256, value: "__PROXY_CODE_SHA256__"}
             - {name: KV_AWARE_ROUTING, value: "__KV_AWARE_ROUTING__"}
             - {name: PROXY_DECODER_COUNT, value: "__PROXY_DECODER_COUNT__"}
             - {name: SESSION_LRU_SIZE, value: "__SESSION_LRU_SIZE__"}
             - {name: PREFIX_HASH_CHARS, value: "__PREFIX_HASH_CHARS__"}
             - {name: PREFIX_LRU_SIZE, value: "__PREFIX_LRU_SIZE__"}
+            - {name: PREFILL_ACTIVE_TOKEN_WEIGHT, value: "__PREFILL_ACTIVE_TOKEN_WEIGHT__"}
           args:
             - --host
             - 0.0.0.0

@@ -33,24 +33,19 @@
     "concurrency": 192,
     "stages": [
       {
-        "name": "qps-4",
-        "rate": 4,
-        "duration": 5
+        "name": "below-knee-qps-2",
+        "rate": 2,
+        "duration": 30
       },
       {
-        "name": "qps-8",
-        "rate": 8,
-        "duration": 5
+        "name": "at-knee-qps-3",
+        "rate": 3,
+        "duration": 30
       },
       {
-        "name": "qps-16",
-        "rate": 16,
-        "duration": 5
-      },
-      {
-        "name": "qps-24",
-        "rate": 24,
-        "duration": 5
+        "name": "above-knee-qps-4.5",
+        "rate": 4.5,
+        "duration": 30
       }
     ]
   },

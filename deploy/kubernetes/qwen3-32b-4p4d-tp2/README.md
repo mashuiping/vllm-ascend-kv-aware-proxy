@@ -77,6 +77,7 @@ Important optional settings:
 | `SESSION_LRU_SIZE` | `4096` |
 | `PREFIX_HASH_CHARS` | `1024` |
 | `PREFIX_LRU_SIZE` | `1024` |
+| `PREFILL_ACTIVE_TOKEN_WEIGHT` | `1.0` |
 
 The default uses Qwen3-32B's native 32K context window and does not require
 RoPE scaling. Prefill remains chunked at 4,096 tokens by default, so longer

@@ -156,7 +156,7 @@ def metric_rows(comparison: dict[str, Any], experiment_valid: bool = True) -> li
     return rows
 
 
-def summary_card(group: str, summary: dict[str, Any]) -> str:
+def summary_card(group: str, summary: dict[str, Any], group_labels: dict[str, str] = GROUP_LABELS) -> str:
     warm = summary.get("warm_turns") or {}
     prefix_probe = (summary.get("per_stage") or {}).get("prefix-probe") or {}
     focus = prefix_probe if prefix_probe else warm
@@ -169,7 +169,7 @@ def summary_card(group: str, summary: dict[str, Any]) -> str:
     return "".join(
         [
             '<article class="card">',
-            f"<h3>{html.escape(GROUP_LABELS[group])}</h3>",
+            f"<h3>{html.escape(group_labels[group])}</h3>",
             f'<div class="big">{html.escape(format_value(focus.get("ttft_ms", {}).get("p95"), "ms"))}</div>',
             f'<div class="caption">{html.escape(focus_label)} TTFT p95</div>',
             "<dl>",
@@ -184,14 +184,14 @@ def summary_card(group: str, summary: dict[str, Any]) -> str:
     )
 
 
-def phase_overview(summaries: dict[str, dict[str, Any]]) -> str:
+def phase_overview(summaries: dict[str, dict[str, Any]], group_labels: dict[str, str] = GROUP_LABELS) -> str:
     rows: list[str] = []
     for group in GROUPS:
         for phase, label in (("cache_fill", "cache-fill"), ("warm_turns", "warm turns")):
             summary = summaries[group].get(phase) or {}
             rows.append(
                 "<tr>"
-                f"<td>{html.escape(GROUP_LABELS[group])}</td>"
+                f"<td>{html.escape(group_labels[group])}</td>"
                 f"<td>{html.escape(label)}</td>"
                 f"<td>{html.escape(str(summary.get('requests', '—')))}</td>"
                 f"<td>{html.escape(format_value(summary.get('success_rate'), '%'))}</td>"
@@ -205,7 +205,7 @@ def phase_overview(summaries: dict[str, dict[str, Any]]) -> str:
                 continue
             rows.append(
                 "<tr>"
-                f"<td>{html.escape(GROUP_LABELS[group])}</td>"
+                f"<td>{html.escape(group_labels[group])}</td>"
                 f"<td>{html.escape(stage)}</td>"
                 f"<td>{html.escape(str(summary.get('requests', '—')))}</td>"
                 f"<td>{html.escape(format_value(summary.get('success_rate'), '%'))}</td>"
@@ -220,14 +220,33 @@ def phase_overview(summaries: dict[str, dict[str, Any]]) -> str:
 def render(experiment_dir: Path, output: Path) -> None:
     comparison = load_json(experiment_dir / "comparison.json")
     summaries = {group: load_json(experiment_dir / group / "summary.json") for group in GROUPS}
+    configs = {group: load_json(experiment_dir / group / "config.json") for group in GROUPS}
+    comparison_mode = (configs["baseline"].get("proxy_identity") or {}).get("comparison_mode") or "affinity"
+    group_labels = dict(GROUP_LABELS)
+    comparison_definitions = COMPARISONS
+    if comparison_mode == "active-token":
+        off_weight = (configs["candidate-off"].get("proxy_identity") or {}).get("actual_active_token_weight", "0")
+        on_weight = (configs["candidate-on"].get("proxy_identity") or {}).get("actual_active_token_weight", "1")
+        group_labels.update(
+            {
+                "baseline": "A · exact upstream",
+                "candidate-off": f"B · candidate weight={off_weight}",
+                "candidate-on": f"C · candidate weight={on_weight}",
+            }
+        )
+        comparison_definitions = (
+            ("A_vs_B", "A → B · candidate integration"),
+            ("B_vs_C", "B → C · active-token lifecycle"),
+            ("A_vs_C", "A → C · total effect"),
+        )
     manifest_path = experiment_dir / "workload.jsonl.manifest.json"
     manifest = load_json(manifest_path) if manifest_path.is_file() else {}
     workload_hash = comparison.get("workload_sha256", "—")
     verified = manifest.get("token_count_verified")
     experiment_valid = comparison.get("valid") is True
-    cards = "".join(summary_card(group, summaries[group]) for group in GROUPS)
+    cards = "".join(summary_card(group, summaries[group], group_labels) for group in GROUPS)
     comparison_sections = []
-    for key, title in COMPARISONS:
+    for key, title in comparison_definitions:
         pair = comparison.get(key) or {}
         comparison_sections.append(
             f"<section><h2>{html.escape(title)}</h2>"
@@ -238,15 +257,15 @@ def render(experiment_dir: Path, output: Path) -> None:
         )
     raw_links = []
     for group in GROUPS:
-        raw_links.append(f'<a href="{html.escape(group)}/summary.json">{html.escape(GROUP_LABELS[group])} summary</a>')
-        raw_links.append(f'<a href="{html.escape(group)}/config.json">{html.escape(GROUP_LABELS[group])} config</a>')
+        raw_links.append(f'<a href="{html.escape(group)}/summary.json">{html.escape(group_labels[group])} summary</a>')
+        raw_links.append(f'<a href="{html.escape(group)}/config.json">{html.escape(group_labels[group])} config</a>')
         if (experiment_dir / group / "validity.json").is_file():
             raw_links.append(
-                f'<a href="{html.escape(group)}/validity.json">{html.escape(GROUP_LABELS[group])} validity</a>'
+                f'<a href="{html.escape(group)}/validity.json">{html.escape(group_labels[group])} validity</a>'
             )
         if (experiment_dir / group / "reset-validation.json").is_file():
             raw_links.append(
-                f'<a href="{html.escape(group)}/reset-validation.json">{html.escape(GROUP_LABELS[group])} reset</a>'
+                f'<a href="{html.escape(group)}/reset-validation.json">{html.escape(group_labels[group])} reset</a>'
             )
     raw_links.extend(
         [
@@ -323,7 +342,7 @@ th:first-child,td:first-child {{ text-align:left; }} tr:last-child td {{ border-
 <section><h2>Phase overview</h2>
 <table><thead><tr><th>Group</th><th>Phase</th><th>Requests</th><th>Success rate</th>
 <th>TTFT p95</th><th>E2E p95</th><th>Cached token ratio</th></tr></thead>
-<tbody>{phase_overview(summaries)}</tbody></table></section>
+<tbody>{phase_overview(summaries, group_labels)}</tbody></table></section>
 {"".join(comparison_sections)}
 <section><h2>Raw artifacts</h2><div class="links">{"".join(raw_links)}</div></section>
 </main></body></html>"""

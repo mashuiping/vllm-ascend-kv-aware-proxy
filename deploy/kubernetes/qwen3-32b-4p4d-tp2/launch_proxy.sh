@@ -51,6 +51,11 @@ decoder_args=(
 # those flags here so the same Kubernetes Deployment can run all A/B/C groups
 # without maintaining nearly identical proxy manifests.
 candidate_args=()
+if [[ "${PROXY_VARIANT}" == "candidate" ]]; then
+  candidate_args+=(
+    --prefill-active-token-weight "${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
+  )
+fi
 if [[ "${KV_AWARE_ROUTING}" == "true" ]]; then
   if [[ "${PROXY_VARIANT}" != "candidate" ]]; then
     echo "KV-aware routing can only be enabled for the candidate proxy" >&2

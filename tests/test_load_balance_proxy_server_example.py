@@ -110,6 +110,13 @@ def test_kv_cache_aware_routing_is_opt_in(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["load_balance_proxy_server_example.py", "--enable-kv-cache-aware-routing"])
     assert proxy.parse_args().enable_kv_cache_aware_routing is True
 
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["load_balance_proxy_server_example.py", "--prefill-active-token-weight", "0.25"],
+    )
+    assert proxy.parse_args().prefill_active_token_weight == 0.25
+
     headers = {"X-Session-ID": "session"}
     body = {"model": "model", "prompt": "a" * 64}
 
@@ -158,6 +165,41 @@ def test_healthcheck_exposes_prefiller_load_and_selection_counts():
         "tainted": False,
     }
     assert sum(load["selections"] for load in health["prefill_loads"].values()) == 1
+
+
+def test_prefill_active_token_weight_can_isolate_kv_only_heap_priority():
+    scheduler = make_scheduler(prefill_active_token_weight=0.0)
+    picked = scheduler.begin_request(100.0, 200.0)
+
+    health = scheduler.healthcheck()
+    assert health["prefill_active_token_weight"] == 0.0
+    assert health["prefill_loads"][picked["key"]]["priority"] == 60.0
+
+
+@pytest.mark.parametrize(
+    ("weight", "expected_ordinal", "actual_differs_from_baseline", "actual_differs_from_active"),
+    [(0.0, 0, 0, 1), (1.0, 1, 1, 0)],
+)
+def test_heap_decisions_record_request_level_shadow_divergence(
+    weight, expected_ordinal, actual_differs_from_baseline, actual_differs_from_active
+):
+    scheduler = make_scheduler(prefill_active_token_weight=weight)
+    first, second = sorted(scheduler.prefillers.values(), key=lambda server: server.ordinal)
+    first.active_tokens = 4000
+    first.active_kv_cache = 4000
+    second.active_tokens = 0
+    second.active_kv_cache = 8000
+    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
+
+    picked = scheduler.begin_request(1, 1)
+    selected = scheduler.prefillers[picked["key"]]
+    stats = scheduler.healthcheck()["prefill_routing_stats"]
+
+    assert selected.ordinal == expected_ordinal
+    assert stats["heap_decisions"] == 1
+    assert stats["shadow_baseline_active_divergences"] == 1
+    assert stats["actual_differs_from_baseline"] == actual_differs_from_baseline
+    assert stats["actual_differs_from_active"] == actual_differs_from_active
 
 
 def test_decoder_picker_tracks_only_decoder_load():

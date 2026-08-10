@@ -88,6 +88,7 @@ class RequestResult:
     prompt_tokens: int | None
     completion_tokens: int | None
     client_cached_tokens: int | None
+    request_body_bytes: int
     output_chars: int
     error: str | None
 
@@ -118,6 +119,29 @@ def percentile(values: list[float], quantile: float) -> float | None:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
 
 
+def correlation(left: list[float], right: list[float]) -> float | None:
+    if len(left) < 2 or len(left) != len(right):
+        return None
+    if len(set(left)) < 2 or len(set(right)) < 2:
+        return None
+    return statistics.correlation(left, right)
+
+
+def ranks(values: list[float]) -> list[float]:
+    ordered = sorted(enumerate(values), key=lambda item: item[1])
+    result = [0.0] * len(values)
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        while end < len(ordered) and ordered[end][1] == ordered[start][1]:
+            end += 1
+        rank = (start + end - 1) / 2
+        for index, _ in ordered[start:end]:
+            result[index] = rank
+        start = end
+    return result
+
+
 def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
     successful = [result for result in results if result.ok]
     ttft = [result.ttft_ms for result in successful if result.ttft_ms is not None]
@@ -137,6 +161,14 @@ def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
         float(result.completion_tokens) for result in successful if result.completion_tokens is not None
     ]
     computed_tokens = [float(result.prompt_tokens - (result.client_cached_tokens or 0)) for result in cache_eligible]
+    body_token_pairs = [
+        (float(result.request_body_bytes), float(result.prompt_tokens))
+        for result in successful
+        if result.prompt_tokens is not None and result.prompt_tokens > 0
+    ]
+    body_bytes = [body for body, _ in body_token_pairs]
+    body_prompt_tokens = [tokens for _, tokens in body_token_pairs]
+    bytes_per_prompt_token = [body / tokens for body, tokens in body_token_pairs]
     started_at = [result.started_at_s for result in successful]
     ended_at = [result.ended_at_s for result in successful]
     window_seconds = max(ended_at) - min(started_at) if started_at and ended_at else 0.0
@@ -164,6 +196,13 @@ def latency_summary(results: list[RequestResult]) -> dict[str, Any]:
         "client_cached_tokens": describe(cached_tokens),
         "client_computed_tokens": describe(computed_tokens),
         "completion_tokens": describe(completion_tokens),
+        "request_body_bytes": describe(body_bytes),
+        "score_calibration": {
+            "pairs": len(body_token_pairs),
+            "bytes_per_prompt_token": describe(bytes_per_prompt_token),
+            "body_bytes_prompt_tokens_pearson": correlation(body_bytes, body_prompt_tokens),
+            "body_bytes_prompt_tokens_spearman": correlation(ranks(body_bytes), ranks(body_prompt_tokens)),
+        },
         "cached_tokens_field_rate": (cached_tokens_field_count / len(cache_eligible) if cache_eligible else None),
         "cached_token_request_rate": (
             sum(value > 0 for value in cached_tokens) / len(cached_tokens) if cached_tokens else None
@@ -558,6 +597,7 @@ def send_request(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    request_body_bytes = len(json.dumps(payload, allow_nan=False).encode("utf-8"))
 
     started_at_s = time.time()
     started = time.perf_counter()
@@ -632,6 +672,7 @@ def send_request(
         prompt_tokens=usage.get("prompt_tokens"),
         completion_tokens=usage.get("completion_tokens"),
         client_cached_tokens=details.get("cached_tokens"),
+        request_body_bytes=request_body_bytes,
         output_chars=len(output),
         error=error,
     )
@@ -763,9 +804,11 @@ def wait_for_prefills_idle(
     timeout: float,
     verify: bool,
     poll_interval: float = 0.25,
+    role_name: str = "Prefill",
 ) -> dict[str, Any]:
     started = time.monotonic()
     last: dict[str, dict[str, float]] = {}
+    consecutive_idle = 0
     while True:
         idle = True
         current: dict[str, dict[str, float]] = {}
@@ -777,17 +820,28 @@ def wait_for_prefills_idle(
                 name for name in ("vllm:num_requests_running", "vllm:num_requests_waiting") if name not in parsed
             }
             if missing:
-                raise RuntimeError(f"Prefill metrics from {base_url} are missing {sorted(missing)}")
+                raise RuntimeError(f"{role_name} metrics from {base_url} are missing {sorted(missing)}")
             running = parsed.get("vllm:num_requests_running", 0.0)
             waiting = parsed.get("vllm:num_requests_waiting", 0.0)
             current[base_url] = {"running": running, "waiting": waiting}
             idle = idle and running <= 0 and waiting <= 0
         last = current
-        if idle:
+        consecutive_idle = consecutive_idle + 1 if idle else 0
+        if consecutive_idle >= 3:
             return {"wait_seconds": time.monotonic() - started, "backends": last}
         if time.monotonic() - started >= timeout:
-            raise TimeoutError(f"Prefill drain timed out after {timeout}s: {last}")
+            raise TimeoutError(f"{role_name} drain timed out after {timeout}s: {last}")
         time.sleep(poll_interval)
+
+
+def wait_for_metric_endpoints_idle(
+    metric_urls: list[str],
+    timeout: float,
+    verify: bool,
+    poll_interval: float = 0.25,
+) -> dict[str, Any]:
+    base_urls = [url.removesuffix("/metrics") for url in metric_urls]
+    return wait_for_prefills_idle(base_urls, timeout, verify, poll_interval, role_name="Decode")
 
 
 def send_reset_probe(
@@ -974,7 +1028,7 @@ def summarize_health_samples(
             decode_instances = health.get("decode_instances")
             if isinstance(decode_instances, int):
                 decode_instance_counts.append(decode_instances)
-            for field in ("session_affinity_stats", "prefix_affinity_stats"):
+            for field in ("session_affinity_stats", "prefix_affinity_stats", "prefill_routing_stats"):
                 current = numeric_stats(health.get(field))
                 if current:
                     first_stats_by_field.setdefault(field, current)
@@ -991,6 +1045,7 @@ def summarize_health_samples(
                 "prefix_cache_capacity",
                 "prefix_spill_max_nodes",
                 "prefill_kv_weight",
+                "prefill_active_token_weight",
             ):
                 value = health.get(field)
                 if isinstance(value, (int, float)):
@@ -1065,6 +1120,23 @@ def summarize_health_samples(
             prefix_delta["derived_prefix_hit_rate"] = prefix_delta.get("hits", 0) / lookups
             prefix_delta["derived_spillover_rate"] = prefix_delta.get("spillover_routes", 0) / lookups
 
+    routing_delta = stats_delta(
+        first_stats_by_field.get("prefill_routing_stats", {}),
+        last_stats_by_field.get("prefill_routing_stats", {}),
+    )
+    if routing_delta:
+        decisions = routing_delta.get("heap_decisions", 0)
+        if decisions:
+            routing_delta["derived_shadow_divergence_rate"] = (
+                routing_delta.get("shadow_baseline_active_divergences", 0) / decisions
+            )
+            routing_delta["derived_actual_vs_baseline_rate"] = (
+                routing_delta.get("actual_differs_from_baseline", 0) / decisions
+            )
+            routing_delta["derived_actual_vs_active_rate"] = (
+                routing_delta.get("actual_differs_from_active", 0) / decisions
+            )
+
     source_deltas = {
         source: stats_delta(first_source_stats.get(source, {}), last) for source, last in last_source_stats.items()
     }
@@ -1105,6 +1177,7 @@ def summarize_health_samples(
         "affinity_config": affinity_config,
         "session_affinity_stats_delta": session_delta,
         "prefix_affinity_stats_delta": prefix_delta,
+        "prefill_routing_stats_delta": routing_delta,
         "prefill_cache_stats_by_source_delta": source_deltas,
     }
 
@@ -1183,12 +1256,26 @@ def parse_args() -> argparse.Namespace:
         help="Sacrificial requests sent before cache reset and metric snapshots.",
     )
     parser.add_argument("--label", default="session-affinity")
+    parser.add_argument(
+        "--proxy-identity-json",
+        help="Verified proxy deployment identity supplied by the A/B/C orchestrator.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--compare-with",
         help="Existing baseline summary.json; writes comparison.json for this run.",
     )
     args = parser.parse_args()
+    proxy_identity_json = args.proxy_identity_json
+    del args.proxy_identity_json
+    args.proxy_identity = None
+    if proxy_identity_json:
+        try:
+            args.proxy_identity = json.loads(proxy_identity_json)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--proxy-identity-json is not valid JSON: {exc}")
+        if not isinstance(args.proxy_identity, dict):
+            parser.error("--proxy-identity-json must contain a JSON object")
     for name in ("prefill_base_url", "prefill_metrics_url", "decode_metrics_url", "metrics_url"):
         setattr(args, name, list(dict.fromkeys(getattr(args, name))))
     if args.sessions <= 0 or args.turns <= 0 or args.concurrency <= 0:
@@ -1259,6 +1346,9 @@ def compare_summaries(baseline: dict[str, Any], treatment: dict[str, Any]) -> di
                 f"per_stage.{stage}.cached_token_ratio",
                 f"per_stage.{stage}.client_computed_tokens.mean",
                 f"per_stage.{stage}.request_throughput_per_second",
+                (f"per_stage_metrics_delta_by_role.{stage}.prefill.derived:mean:vllm:request_prefill_time_seconds"),
+                (f"per_stage_metrics_delta_by_role.{stage}.prefill.derived:mean:vllm:request_queue_time_seconds"),
+                (f"per_stage_metrics_delta_by_role.{stage}.decode.derived:mean:vllm:request_queue_time_seconds"),
             ]
         )
     comparison: dict[str, Any] = {}
@@ -1427,6 +1517,18 @@ def main() -> int:
             encoding="utf-8",
         )
 
+    decode_idle_validation: dict[str, Any] | None = None
+    if args.decode_metrics_url:
+        decode_idle_validation = wait_for_metric_endpoints_idle(
+            args.decode_metrics_url,
+            args.reset_drain_timeout,
+            verify,
+        )
+        (output_dir / "decode-idle-validation.json").write_text(
+            json.dumps(decode_idle_validation, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
     requests_writer = JsonlWriter(output_dir / "requests.jsonl")
     samples_writer = JsonlWriter(samples_path)
     all_metrics_urls = list(dict.fromkeys(args.prefill_metrics_url + args.decode_metrics_url + args.metrics_url))
@@ -1455,6 +1557,16 @@ def main() -> int:
     thread_local = threading.local()
     measurement_metrics_before: dict[str, dict[str, float]] | None = None
     measurement_health_started_at: float | None = None
+    stage_metric_snapshots: dict[str, tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]] = {}
+    stage_timings: dict[str, dict[str, float]] = {}
+
+    # Some planned workloads, notably load-balance, contain only measured
+    # stages. In that case the sampler's initial snapshot is already the exact
+    # measurement boundary; waiting for a cache-fill transition would leave
+    # measurement_metrics_delta_by_role empty.
+    if planned_records and planned_records[0].phase == "measure":
+        measurement_metrics_before = sampler.before
+        measurement_health_started_at = sampler.snapshot_health("measure-start")
 
     def warm_hot_prefix() -> None:
         warmup_http = make_http_session(1)
@@ -1565,9 +1677,12 @@ def main() -> int:
             if planned_records is not None:
                 batches = workload_stages(planned_records)
                 for batch_index, batch in enumerate(batches):
+                    stage_name = batch[0].stage
+                    stage_suffix = re.sub(r"[^a-zA-Z0-9_.-]+", "-", stage_name)
                     offsets = [record.scheduled_offset_s for record in batch]
                     if offsets != sorted(offsets):
                         raise ValueError(f"scheduled offsets are not sorted in stage {batch[0].stage}")
+                    stage_metrics_before = sampler.snapshot_metrics(output_dir, f"before-stage-{stage_suffix}")
                     stage_started = time.perf_counter()
                     pending: set[concurrent.futures.Future[tuple[int, RequestResult, str]]] = set()
                     for record in batch:
@@ -1582,8 +1697,20 @@ def main() -> int:
                             for future in done:
                                 record_completed(future)
                         pending.add(executor.submit(invoke_planned, record))
+                    stage_launch_finished = time.perf_counter()
                     for future in concurrent.futures.as_completed(pending):
                         record_completed(future)
+                    stage_finished = time.perf_counter()
+                    stage_metrics_after = sampler.snapshot_metrics(output_dir, f"after-stage-{stage_suffix}")
+                    stage_metric_snapshots[stage_name] = (stage_metrics_before, stage_metrics_after)
+                    launch_span = max(offsets) - min(offsets) if offsets else 0.0
+                    stage_timings[stage_name] = {
+                        "configured_launch_span_seconds": launch_span,
+                        "actual_launch_span_seconds": stage_launch_finished - stage_started,
+                        "wall_time_seconds": stage_finished - stage_started,
+                        "drain_seconds": stage_finished - stage_launch_finished,
+                        "scheduled_request_rate_per_second": (len(batch) / launch_span if launch_span > 0 else None),
+                    }
                     print_stage(batch[0].stage, batch[0].phase)
                     next_phase = batches[batch_index + 1][0].phase if batch_index + 1 < len(batches) else None
                     if batch[0].phase == "cache-fill" and next_phase != "cache-fill":
@@ -1630,6 +1757,9 @@ def main() -> int:
     }
     metric_deltas_by_role = {}
     measurement_metric_deltas_by_role = {}
+    stage_metric_deltas_by_role: dict[str, dict[str, dict[str, float]]] = {
+        stage: {} for stage in stage_metric_snapshots
+    }
     for role, urls in (
         ("prefill", args.prefill_metrics_url),
         ("decode", args.decode_metrics_url),
@@ -1644,6 +1774,11 @@ def main() -> int:
                 measurement_metric_deltas_by_role[role] = counter_delta(
                     aggregate_metric_snapshots(urls, measurement_metrics_before),
                     aggregate_metric_snapshots(urls, sampler.after),
+                )
+            for stage, (before, after) in stage_metric_snapshots.items():
+                stage_metric_deltas_by_role[stage][role] = counter_delta(
+                    aggregate_metric_snapshots(urls, before),
+                    aggregate_metric_snapshots(urls, after),
                 )
     scenario = planned_records[0].scenario if planned_records else args.scenario
     turns = sorted({result.turn for result in all_results if result.turn >= 0})
@@ -1670,6 +1805,8 @@ def main() -> int:
         ),
         "metrics_delta_by_role": metric_deltas_by_role,
         "measurement_metrics_delta_by_role": measurement_metric_deltas_by_role,
+        "per_stage_metrics_delta_by_role": stage_metric_deltas_by_role,
+        "per_stage_timing": stage_timings,
         "metrics_delta_by_url": metric_deltas,
         "prefill_backend_balance": summarize_backend_balance(args.prefill_metrics_url, metric_deltas),
     }
@@ -1691,6 +1828,24 @@ def main() -> int:
             not args.decode_metrics_url
             or all(url in sampler.before and url in sampler.after for url in args.decode_metrics_url)
         ),
+        "measurement_metrics_present": (
+            not all_metrics_urls
+            or (
+                measurement_metrics_before is not None
+                and all(
+                    role in measurement_metric_deltas_by_role and bool(measurement_metric_deltas_by_role[role])
+                    for role, urls in (
+                        ("prefill", args.prefill_metrics_url),
+                        ("decode", args.decode_metrics_url),
+                        ("unclassified", args.metrics_url),
+                    )
+                    if urls
+                )
+            )
+        ),
+        "per_stage_metrics_complete": (
+            not planned_records or not all_metrics_urls or set(stage_metric_deltas_by_role) == set(stages)
+        ),
         "decode_count_matches": (
             not args.expected_decode_count
             or (
@@ -1699,7 +1854,43 @@ def main() -> int:
                 == summary["proxy_prefill_load_balance"]["decode_instance_count_max"]
             )
         ),
+        "decode_idle_verified": not args.decode_metrics_url or decode_idle_validation is not None,
     }
+    proxy_identity = args.proxy_identity
+    if proxy_identity is not None:
+        required_identity_fields = (
+            "group",
+            "comparison_mode",
+            "expected_variant",
+            "actual_variant",
+            "expected_kv_aware",
+            "actual_kv_aware",
+            "expected_active_token_weight",
+            "actual_active_token_weight",
+            "expected_source_sha256",
+            "actual_source_sha256",
+            "pod_name",
+            "pod_uid",
+            "image_id",
+        )
+        required_checks["proxy_identity_complete"] = all(proxy_identity.get(name) for name in required_identity_fields)
+        required_checks["proxy_group_matches"] = proxy_identity.get("group") == args.label
+        required_checks["proxy_source_hash_matches"] = proxy_identity.get(
+            "expected_source_sha256"
+        ) == proxy_identity.get("actual_source_sha256")
+        required_checks["proxy_variant_matches"] = proxy_identity.get("expected_variant") == proxy_identity.get(
+            "actual_variant"
+        )
+        required_checks["proxy_kv_aware_flag_matches"] = proxy_identity.get("expected_kv_aware") == proxy_identity.get(
+            "actual_kv_aware"
+        )
+        required_checks["proxy_active_token_weight_matches"] = proxy_identity.get(
+            "expected_active_token_weight"
+        ) == proxy_identity.get("actual_active_token_weight")
+        (output_dir / "proxy-identity.json").write_text(
+            json.dumps(proxy_identity, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     if scenario == "session-long" and args.reset_before:
         required_checks["cold_turn_has_no_cache_hits"] = summary["cold_turn"]["cached_token_request_rate"] == 0
     if scenario == "shared-prefix" and args.reset_before:
@@ -1709,6 +1900,25 @@ def main() -> int:
         required_checks["shared_prefix_probe_present"] = (
             summary["per_stage"].get("prefix-probe", {}).get("requests", 0) > 0
         )
+    if scenario == "load-balance":
+        calibration = summary["measured"].get("score_calibration") or {}
+        required_checks["load_score_calibration_present"] = calibration.get("pairs") == summary["measured"].get(
+            "successes"
+        )
+        spearman = calibration.get("body_bytes_prompt_tokens_spearman")
+        required_checks["load_score_correlates_with_prompt_tokens"] = (
+            isinstance(spearman, (int, float)) and spearman >= 0.9
+        )
+        if isinstance(proxy_identity, dict) and proxy_identity.get("actual_variant") == "candidate":
+            lifecycle = summary["proxy_prefill_load_balance_measurement"]
+            required_checks["lifecycle_overlap_exposed"] = (
+                lifecycle.get("lifecycle_overlap_sample_rate") or 0.0
+            ) >= 0.3
+            required_checks["lifecycle_skew_exposed"] = (lifecycle.get("lifecycle_skew_sample_rate") or 0.0) >= 0.3
+            routing = lifecycle.get("prefill_routing_stats_delta") or {}
+            required_checks["shadow_heap_divergence_exposed"] = (
+                routing.get("derived_shadow_divergence_rate") or 0.0
+            ) >= 0.1
     validity = {
         "valid": all(required_checks.values()),
         "checks": required_checks,

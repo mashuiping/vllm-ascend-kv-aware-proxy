@@ -33,6 +33,7 @@ def make_result(*, cached_tokens, ttft_ms, ok=True):
         prompt_tokens=100,
         completion_tokens=8,
         client_cached_tokens=cached_tokens,
+        request_body_bytes=400,
         output_chars=8,
         error=None if ok else "failed",
     )
@@ -85,7 +86,10 @@ def test_compare_summaries_includes_shared_prefix_stage_metrics():
                 "client_computed_tokens": {"mean": 80.0},
                 "request_throughput_per_second": 10.0,
             }
-        }
+        },
+        "per_stage_metrics_delta_by_role": {
+            "prefix-probe": {"prefill": {"derived:mean:vllm:request_queue_time_seconds": 2.0}}
+        },
     }
     treatment = {
         "per_stage": {
@@ -97,13 +101,22 @@ def test_compare_summaries_includes_shared_prefix_stage_metrics():
                 "client_computed_tokens": {"mean": 20.0},
                 "request_throughput_per_second": 12.0,
             }
-        }
+        },
+        "per_stage_metrics_delta_by_role": {
+            "prefix-probe": {"prefill": {"derived:mean:vllm:request_queue_time_seconds": 1.0}}
+        },
     }
 
     comparison = benchmark.compare_summaries(baseline, treatment)
 
     assert comparison["per_stage.prefix-probe.cached_token_request_rate"]["improvement"] == 3.0
     assert comparison["per_stage.prefix-probe.ttft_ms.p95"]["improvement"] == 0.5
+    assert (
+        comparison["per_stage_metrics_delta_by_role.prefix-probe.prefill.derived:mean:vllm:request_queue_time_seconds"][
+            "improvement"
+        ]
+        == 0.5
+    )
 
 
 def test_parse_prometheus_aggregates_backends_and_ignores_unrelated_metrics():
@@ -196,6 +209,10 @@ def test_health_summary_exposes_active_token_lifecycle_divergence(tmp_path: Path
             "timestamp": 1.0,
             "kind": "proxy_health",
             "value": {
+                "prefill_routing_stats": {
+                    "heap_decisions": 0,
+                    "shadow_baseline_active_divergences": 0,
+                },
                 "prefill_loads": {
                     "p0": {
                         "ordinal": 0,
@@ -211,13 +228,17 @@ def test_health_summary_exposes_active_token_lifecycle_divergence(tmp_path: Path
                         "priority": 2400,
                         "selections": 1,
                     },
-                }
+                },
             },
         },
         {
             "timestamp": 2.0,
             "kind": "proxy_health",
             "value": {
+                "prefill_routing_stats": {
+                    "heap_decisions": 10,
+                    "shadow_baseline_active_divergences": 5,
+                },
                 "prefill_loads": {
                     "p0": {
                         "ordinal": 0,
@@ -233,7 +254,7 @@ def test_health_summary_exposes_active_token_lifecycle_divergence(tmp_path: Path
                         "priority": 10400,
                         "selections": 2,
                     },
-                }
+                },
             },
         },
     ]
@@ -247,6 +268,7 @@ def test_health_summary_exposes_active_token_lifecycle_divergence(tmp_path: Path
     assert summary["lifecycle_overlap_sample_rate"] == 0.5
     assert summary["lifecycle_skew_sample_rate"] == 0.5
     assert summary["shadow_heap_divergence_sample_rate"] == 0.5
+    assert summary["prefill_routing_stats_delta"]["derived_shadow_divergence_rate"] == 0.5
 
 
 def test_verify_reset_across_prefills_primes_checks_and_cleans(tmp_path: Path, monkeypatch):

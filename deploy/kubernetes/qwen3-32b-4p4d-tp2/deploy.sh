@@ -11,6 +11,7 @@ PROXY_DECODER_COUNT="${PROXY_DECODER_COUNT:-4}"
 SESSION_LRU_SIZE="${SESSION_LRU_SIZE:-4096}"
 PREFIX_HASH_CHARS="${PREFIX_HASH_CHARS:-1024}"
 PREFIX_LRU_SIZE="${PREFIX_LRU_SIZE:-1024}"
+PREFILL_ACTIVE_TOKEN_WEIGHT="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
 
 case "${PROXY_VARIANT}" in
   candidate)
@@ -25,6 +26,14 @@ case "${PROXY_VARIANT}" in
     ;;
 esac
 PROXY_SOURCE_PATH="${PROXY_SOURCE_PATH:-${DEFAULT_PROXY_SOURCE_PATH}}"
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
 
 NAMESPACE="${NAMESPACE:-qwen-pd}"
 VLLM_IMAGE="${VLLM_IMAGE:-quay.io/ascend/vllm-ascend:v0.18.0}"
@@ -41,6 +50,7 @@ DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-64}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 RESTART_TOKEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PROXY_CODE_SHA256="$(sha256_file "${PROXY_SOURCE_PATH}")"
 
 usage() {
   cat <<'EOF'
@@ -125,11 +135,13 @@ render() {
     -e "s|__GPU_MEMORY_UTILIZATION__|$(escape_sed_replacement "${GPU_MEMORY_UTILIZATION}")|g" \
     -e "s|__REASONING_PARSER__|$(escape_sed_replacement "${REASONING_PARSER}")|g" \
     -e "s|__PROXY_VARIANT__|$(escape_sed_replacement "${PROXY_VARIANT}")|g" \
+    -e "s|__PROXY_CODE_SHA256__|$(escape_sed_replacement "${PROXY_CODE_SHA256}")|g" \
     -e "s|__KV_AWARE_ROUTING__|$(escape_sed_replacement "${KV_AWARE_ROUTING}")|g" \
     -e "s|__PROXY_DECODER_COUNT__|$(escape_sed_replacement "${PROXY_DECODER_COUNT}")|g" \
     -e "s|__SESSION_LRU_SIZE__|$(escape_sed_replacement "${SESSION_LRU_SIZE}")|g" \
     -e "s|__PREFIX_HASH_CHARS__|$(escape_sed_replacement "${PREFIX_HASH_CHARS}")|g" \
     -e "s|__PREFIX_LRU_SIZE__|$(escape_sed_replacement "${PREFIX_LRU_SIZE}")|g" \
+    -e "s|__PREFILL_ACTIVE_TOKEN_WEIGHT__|$(escape_sed_replacement "${PREFILL_ACTIVE_TOKEN_WEIGHT}")|g" \
     -e "s|__RESTART_TOKEN__|$(escape_sed_replacement "${RESTART_TOKEN}")|g" \
     "${file}"
 }

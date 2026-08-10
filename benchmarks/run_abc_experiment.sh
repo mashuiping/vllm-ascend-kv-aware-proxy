@@ -14,11 +14,25 @@ shift
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_DIR="${REPO_ROOT}/deploy/kubernetes/qwen3-32b-4p4d-tp2"
+BASELINE_PROXY_SOURCE_PATH="${BASELINE_PROXY_SOURCE_PATH:-${REPO_ROOT}/baseline/load_balance_proxy_server_example.py}"
+CANDIDATE_PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH:-${REPO_ROOT}/load_balance_proxy_server_example.py}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 EXECUTION_MODE="${BENCHMARK_EXECUTION_MODE:-pod}"
 NAMESPACE="${NAMESPACE:-qwen-pd}"
 VLLM_IMAGE="${VLLM_IMAGE:-quay.io/ascend/vllm-ascend:v0.18.0}"
 RESET_FAILURE_ACTION="${RESET_FAILURE_ACTION:-abort}"
+
+if [[ -n "${PROXY_SOURCE_PATH:-}" ]]; then
+  echo "PROXY_SOURCE_PATH is unsafe for A/B/C runs because it overrides every group; use BASELINE_PROXY_SOURCE_PATH and CANDIDATE_PROXY_SOURCE_PATH" >&2
+  exit 2
+fi
+
+for proxy_source in "${BASELINE_PROXY_SOURCE_PATH}" "${CANDIDATE_PROXY_SOURCE_PATH}"; do
+  if [[ "${proxy_source}" != /* || ! -f "${proxy_source}" ]]; then
+    echo "proxy source must be an existing absolute path: ${proxy_source}" >&2
+    exit 2
+  fi
+done
 
 case "${RESET_FAILURE_ACTION}" in
   abort|restart) ;;
@@ -53,6 +67,32 @@ concurrency="${CONCURRENCY:-${profile_concurrency}}"
 read -r profile_decoder_count profile_sample_interval <<<"$("${PYTHON_BIN}" -c \
   'import json, sys; p=json.load(open(sys.argv[1], encoding="utf-8")); print(p.get("deployment", {}).get("proxy_decoder_count", 4), p.get("observability", {}).get("sample_interval_s", 1.0))' \
   "${PROFILE}")"
+profile_scenario="$("${PYTHON_BIN}" -c \
+  'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("scenario", ""))' \
+  "${PROFILE}")"
+profile_seed="$("${PYTHON_BIN}" -c \
+  'import json, sys; print(int(json.load(open(sys.argv[1], encoding="utf-8")).get("seed", 20260724)))' \
+  "${PROFILE}")"
+workload_seed="${WORKLOAD_SEED:-${profile_seed}}"
+if [[ ! "${workload_seed}" =~ ^-?[0-9]+$ ]]; then
+  echo "WORKLOAD_SEED/profile seed must be an integer: ${workload_seed}" >&2
+  exit 2
+fi
+comparison_mode="${ABC_COMPARISON_MODE:-auto}"
+if [[ "${comparison_mode}" == "auto" ]]; then
+  if [[ "${profile_scenario}" == "load-balance" ]]; then
+    comparison_mode=active-token
+  else
+    comparison_mode=affinity
+  fi
+fi
+case "${comparison_mode}" in
+  affinity|active-token) ;;
+  *)
+    echo "ABC_COMPARISON_MODE must be auto, affinity, or active-token: ${comparison_mode}" >&2
+    exit 2
+    ;;
+esac
 decoder_count="${BENCHMARK_DECODER_COUNT:-${profile_decoder_count}}"
 sample_interval="${SAMPLE_INTERVAL:-${profile_sample_interval}}"
 case "${decoder_count}" in
@@ -62,9 +102,9 @@ case "${decoder_count}" in
     exit 2
     ;;
 esac
-workload_override_args=()
+workload_override_args=(--seed "${workload_seed}")
 if [[ -n "${SYSTEM_PROMPT_TOKENS:-}" ]]; then
-  workload_override_args=(--system-prompt-tokens "${SYSTEM_PROMPT_TOKENS}")
+  workload_override_args+=(--system-prompt-tokens "${SYSTEM_PROMPT_TOKENS}")
   log "overriding data.system_prompt_tokens=${SYSTEM_PROMPT_TOKENS} for generated workload"
 fi
 read -r -a groups <<<"${GROUP_ORDER:-baseline candidate-off candidate-on}"
@@ -84,12 +124,16 @@ for expected_group in baseline candidate-off candidate-on; do
   fi
 done
 
-log "A/B/C experiment started: mode=${EXECUTION_MODE} profile=${PROFILE} decoder_count=${decoder_count} concurrency=${concurrency} sample_interval=${sample_interval}s output=${experiment_dir}"
+log "A/B/C experiment started: mode=${EXECUTION_MODE} comparison=${comparison_mode} profile=${PROFILE} seed=${workload_seed} decoder_count=${decoder_count} concurrency=${concurrency} sample_interval=${sample_interval}s output=${experiment_dir}"
 
 run_local() {
   : "${BASE_URL:?BASE_URL is required in local mode}"
   : "${TOKENIZER_URL:?TOKENIZER_URL is required in local mode}"
   local workload_file="${experiment_dir}/workload.jsonl"
+  local metadata_json
+  metadata_json="$(build_metadata_json)"
+  "${PYTHON_BIN}" -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2] + "\n", encoding="utf-8")' \
+    "${experiment_dir}/metadata.json" "${metadata_json}"
 
   log "generating one shared workload via ${TOKENIZER_URL}"
   "${PYTHON_BIN}" "${SCRIPT_DIR}/generate_benchmark_workload.py" \
@@ -109,6 +153,9 @@ run_local() {
     OUTPUT_DIR="${experiment_dir}/${group}" \
     CONCURRENCY="${concurrency}" \
     PROXY_DECODER_COUNT="${decoder_count}" \
+    ABC_COMPARISON_MODE="${comparison_mode}" \
+    BASELINE_PROXY_SOURCE_PATH="${BASELINE_PROXY_SOURCE_PATH}" \
+    CANDIDATE_PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH}" \
       bash "${SCRIPT_DIR}/run_experiment.sh" "${group}" --sample-interval "${sample_interval}" "$@"
     log "completed group=${group}"
   done
@@ -123,18 +170,30 @@ deploy_proxy_group() {
   local group="$1"
   local proxy_variant
   local kv_aware
+  local proxy_source
+  local active_token_weight="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
   case "${group}" in
     baseline)
       proxy_variant=baseline
       kv_aware=false
+      proxy_source="${BASELINE_PROXY_SOURCE_PATH}"
       ;;
     candidate-off)
       proxy_variant=candidate
       kv_aware=false
+      proxy_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "active-token" ]]; then
+        active_token_weight=0
+      fi
       ;;
     candidate-on)
       proxy_variant=candidate
-      kv_aware=true
+      if [[ "${comparison_mode}" == "active-token" ]]; then
+        kv_aware=false
+      else
+        kv_aware=true
+      fi
+      proxy_source="${CANDIDATE_PROXY_SOURCE_PATH}"
       ;;
     *)
       echo "unknown group: ${group}; expected baseline, candidate-off, or candidate-on" >&2
@@ -143,7 +202,91 @@ deploy_proxy_group() {
   esac
   log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware} decoder_count=${decoder_count}"
   PROXY_VARIANT="${proxy_variant}" KV_AWARE_ROUTING="${kv_aware}" PROXY_DECODER_COUNT="${decoder_count}" \
+    PREFILL_ACTIVE_TOKEN_WEIGHT="${active_token_weight}" \
+    PROXY_SOURCE_PATH="${proxy_source}" \
     bash "${DEPLOY_DIR}/deploy.sh" proxy
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+build_metadata_json() {
+  local baseline_sha candidate_sha repository_commit repository_dirty benchmark_sha workload_generator_sha comparison_sha profile_sha
+  baseline_sha="$(sha256_file "${BASELINE_PROXY_SOURCE_PATH}")"
+  candidate_sha="$(sha256_file "${CANDIDATE_PROXY_SOURCE_PATH}")"
+  repository_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]]; then
+    repository_dirty=true
+  else
+    repository_dirty=false
+  fi
+  benchmark_sha="$(sha256_file "${SCRIPT_DIR}/benchmark_session_affinity.py")"
+  workload_generator_sha="$(sha256_file "${SCRIPT_DIR}/generate_benchmark_workload.py")"
+  comparison_sha="$(sha256_file "${SCRIPT_DIR}/compare_abc_results.py")"
+  profile_sha="$(sha256_file "${PROFILE}")"
+  "${PYTHON_BIN}" -c \
+    'import json,sys; print(json.dumps({"comparison_mode":sys.argv[1],"group_order":sys.argv[2].split(),"profile":sys.argv[3],"profile_scenario":sys.argv[4],"repository_commit":sys.argv[5],"repository_dirty":sys.argv[6]=="true","baseline_source_sha256":sys.argv[7],"candidate_source_sha256":sys.argv[8],"benchmark_sha256":sys.argv[9],"workload_generator_sha256":sys.argv[10],"comparison_tool_sha256":sys.argv[11],"profile_sha256":sys.argv[12],"model":sys.argv[13],"image":sys.argv[14],"proxy_decoder_count":int(sys.argv[15]),"sample_interval_seconds":float(sys.argv[16]),"workload_seed":int(sys.argv[17])}, separators=(",", ":")))' \
+    "${comparison_mode}" "${groups[*]}" "${PROFILE}" "${profile_scenario}" "${repository_commit}" "${repository_dirty}" \
+    "${baseline_sha}" "${candidate_sha}" "${benchmark_sha}" "${workload_generator_sha}" "${comparison_sha}" "${profile_sha}" \
+    "${MODEL}" "${VLLM_IMAGE}" "${decoder_count}" "${sample_interval}" "${workload_seed}"
+}
+
+verify_proxy_group() {
+  local group="$1"
+  local expected_variant expected_kv_aware expected_source expected_active_token_weight
+  expected_active_token_weight="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
+  case "${group}" in
+    baseline)
+      expected_variant=baseline
+      expected_kv_aware=false
+      expected_source="${BASELINE_PROXY_SOURCE_PATH}"
+      ;;
+    candidate-off)
+      expected_variant=candidate
+      expected_kv_aware=false
+      expected_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "active-token" ]]; then
+        expected_active_token_weight=0
+      fi
+      ;;
+    candidate-on)
+      expected_variant=candidate
+      if [[ "${comparison_mode}" == "active-token" ]]; then
+        expected_kv_aware=false
+      else
+        expected_kv_aware=true
+      fi
+      expected_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      ;;
+  esac
+
+  local pod_name expected_sha actual_sha actual_variant actual_kv_aware actual_active_token_weight pod_uid image_id
+  pod_name="$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=pd-proxy \
+    --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}')"
+  [[ -n "${pod_name}" ]] || { echo "${group}: no proxy pod found" >&2; return 1; }
+  expected_sha="$(sha256_file "${expected_source}")"
+  actual_sha="$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
+    'import hashlib, pathlib; print(hashlib.sha256(pathlib.Path("/opt/pd-proxy/load_balance_proxy_server_example.py").read_bytes()).hexdigest())')"
+  read -r actual_variant actual_kv_aware actual_active_token_weight < <(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
+    'import os; print(os.environ.get("PROXY_VARIANT", ""), os.environ.get("KV_AWARE_ROUTING", ""), os.environ.get("PREFILL_ACTIVE_TOKEN_WEIGHT", ""))')
+  pod_uid="$(kubectl -n "${NAMESPACE}" get pod "${pod_name}" -o jsonpath='{.metadata.uid}')"
+  image_id="$(kubectl -n "${NAMESPACE}" get pod "${pod_name}" -o jsonpath='{.status.containerStatuses[?(@.name=="proxy")].imageID}')"
+
+  if [[ "${actual_sha}" != "${expected_sha}" || "${actual_variant}" != "${expected_variant}" || "${actual_kv_aware}" != "${expected_kv_aware}" || "${actual_active_token_weight}" != "${expected_active_token_weight}" ]]; then
+    echo "${group}: proxy identity mismatch expected=${expected_variant}/${expected_kv_aware}/weight-${expected_active_token_weight}/${expected_sha} actual=${actual_variant}/${actual_kv_aware}/weight-${actual_active_token_weight}/${actual_sha}" >&2
+    return 1
+  fi
+
+  "${PYTHON_BIN}" -c \
+    'import json,sys; print(json.dumps(dict(zip(("group","comparison_mode","expected_variant","actual_variant","expected_kv_aware","actual_kv_aware","expected_active_token_weight","actual_active_token_weight","expected_source_sha256","actual_source_sha256","pod_name","pod_uid","image_id"), sys.argv[1:])), separators=(",", ":")))' \
+    "${group}" "${comparison_mode}" "${expected_variant}" "${actual_variant}" "${expected_kv_aware}" "${actual_kv_aware}" \
+    "${expected_active_token_weight}" "${actual_active_token_weight}" \
+    "${expected_sha}" "${actual_sha}" "${pod_name}" "${pod_uid}" "${image_id}"
 }
 
 run_in_pod() {
@@ -204,6 +347,12 @@ run_in_pod() {
     "${benchmark_manifest}" | kubectl -n "${NAMESPACE}" apply -f -
   kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${pod_name}" --timeout=10m
 
+  local metadata_json
+  metadata_json="$(build_metadata_json)"
+  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
+    'import pathlib,sys; pathlib.Path("/results/metadata.json").write_text(sys.argv[1] + "\n", encoding="utf-8")' \
+    "${metadata_json}"
+
   log "checking benchmark pod runtime dependencies"
   kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
     python -c 'import requests'
@@ -224,6 +373,8 @@ run_in_pod() {
   local group
   for group in "${groups[@]}"; do
     deploy_proxy_group "${group}"
+    local proxy_identity_json
+    proxy_identity_json="$(verify_proxy_group "${group}")"
     log "${group}: proxy ready; benchmark pod is starting workload"
     local -a benchmark_command=(
       python /opt/benchmark/benchmark_session_affinity.py
@@ -243,7 +394,8 @@ run_in_pod() {
       "${backend_args[@]}"
       "$@"
     )
-    if ! kubectl -n "${NAMESPACE}" exec "${pod_name}" -- "${benchmark_command[@]}"; then
+    if ! kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+      "${benchmark_command[@]}" --proxy-identity-json "${proxy_identity_json}"; then
       if [[ "${RESET_FAILURE_ACTION}" != "restart" ]] || ! kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
         python -c 'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); sys.exit(0 if p.is_file() and not json.loads(p.read_text()).get("verified") else 1)' \
         "/results/${group}/reset-validation.json"; then
@@ -253,8 +405,10 @@ run_in_pod() {
       kubectl -n "${NAMESPACE}" rollout restart statefulset/pd-prefill
       kubectl -n "${NAMESPACE}" rollout status statefulset/pd-prefill --timeout=60m
       deploy_proxy_group "${group}"
+      proxy_identity_json="$(verify_proxy_group "${group}")"
       log "${group}: Prefillers restarted; retrying benchmark once"
-      kubectl -n "${NAMESPACE}" exec "${pod_name}" -- "${benchmark_command[@]}"
+      kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+        "${benchmark_command[@]}" --proxy-identity-json "${proxy_identity_json}"
     fi
     log "completed group=${group}"
   done
