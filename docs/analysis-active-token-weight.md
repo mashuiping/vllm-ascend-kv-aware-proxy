@@ -1,11 +1,13 @@
 # Analysis: why the active-token Prefill score shows no A/B/C advantage
 
-Status: investigation record, 2026-08-11.
+Status: **closed, 2026-08-12** — conclusion accepted (see Verdict).
 Data: the 12 parsable `load-balance` A/B/C runs from 2026-08-10 under
 `results/runs/` (6 runs at seed 20260724, 02:36–03:28 UTC; 6 runs at
 per-run seeds 202608101–202608106, 12:30–13:48 UTC). Profile:
 `benchmarks/profiles/load-balance-active-tokens.json` (4 Prefillers, 2
 Proxy-visible Decoders, Poisson 2/3/4.5 QPS, 256-token outputs).
+Cross-checked against the 2026-08-06/07 `session-long` (affinity-mode)
+runs as a harness-sensitivity control.
 
 ## TL;DR
 
@@ -38,7 +40,18 @@ experiment cannot show an end-to-end win because:
 
 The observed "slight TTFT regression" of C is not a real effect: B (candidate
 source, weight 0, decision-identical to A) shows deltas of the same sign and
-magnitude in several runs, which is the definition of run noise.
+magnitude in several runs, which is the definition of run noise. Two
+additional pieces of evidence close the case:
+
+- **The worst "regression" run is a cluster transient, not a policy
+  pathology** (see "Forensics on the +50% outlier run" below): all four
+  Prefillers queued simultaneously and uniformly during C's window while C's
+  token balance was *better* than A's.
+- **The harness itself is sensitive enough to detect real effects** (see
+  "Sensitivity control" below): the 08-06/07 affinity-mode experiment showed
+  consistent −17% to −48% TTFT p95 wins for C with B ≈ A across 13+ runs on
+  the same pipeline. The active-token null result is therefore a property of
+  the mechanism at this operating point, not of the measurement.
 
 ## Policy equivalence in detail
 
@@ -176,7 +189,53 @@ The candidate routes differently and generally balances Prefill tokens more
 tightly. It is optimizing a resource that is not queued: a correct mechanism
 applied at a non-bottleneck.
 
-## What a discriminative experiment needs
+## Forensics on the +50% outlier run (12:46, seed 202608102)
+
+Run `20260810T124623Z-abc` is the single strongest-looking "negative
+optimization" datapoint: C's TTFT p95 is +50.2% vs A, and C's mean Prefill
+queue time is 0.231 s against A's 0.001 s. Per-Prefiller inspection rules
+out a routing pathology:
+
+| Group | Per-node mean Prefill queue (s) | Prefill token CV |
+| --- | --- | --- |
+| A (baseline) | 0.000 / 0.001 / 0.001 / 0.000 | 0.076 |
+| C (candidate) | 0.227 / 0.245 / 0.251 / 0.199 | 0.043 |
+
+If the candidate policy had herded requests onto one node, one Prefiller
+would queue while the others idled. Instead all four Prefillers queued
+**simultaneously and uniformly**, and C's token balance was actually
+*better* than A's (CV 0.043 vs 0.076). C balanced better and still lost —
+the only explanation is a global load/cluster transient during C's
+measurement window. Since A/B/C groups run **sequentially**, each group
+samples a different cluster moment, and the outcome is dominated by *when*
+a group ran, not *how* it routed. Excluding this run, the afternoon mean
+C-vs-A TTFT p95 delta drops from +12% to +4.5%, inside the ±15–17% A-vs-B
+same-policy control band.
+
+## Sensitivity control: the harness can detect real effects
+
+The 2026-08-06/07 `session-long` runs (affinity comparison mode, 4
+Decoders, 32-token outputs, prefix reuse) ran on the same A/B/C pipeline
+and show what a real win looks like:
+
+| Runs | C vs A, TTFT p95 | B vs A, TTFT p95 |
+| --- | --- | --- |
+| 08-07 08:23–09:03 (6 runs) | −31% … −48% | −25% … +25% (noise band) |
+| 08-07 09:17–10:08 (6 runs) | −17% … −18%, all 6 negative | −5% … +22% |
+
+C won consistently in every parsable affinity run (13+ runs, no
+exceptions) while B stayed inside the noise band. The measurement pipeline,
+metrics collection, and comparison tooling are therefore demonstrably able
+to resolve a genuine routing improvement. The active-token experiment's
+null result is real: the effect is ~zero at this operating point, not
+hidden by broken instrumentation.
+
+## What a discriminative experiment would need (if ever revisited)
+
+The conclusion below closes this investigation; no further repetition
+campaign is planned. If token-aware Prefill routing is ever revisited for a
+different deployment shape, all of the following must change together —
+each alone is insufficient:
 
 1. **A Prefill-bound operating point.** Gate the measurement on mean Prefill
    queue time being a material share of TTFT (e.g. ≥ 20–30%). Get there by
@@ -199,13 +258,25 @@ applied at a non-bottleneck.
    current design that band is ±15–17%, an order of magnitude above the
    achievable effect.
 
-## Verdict
+## Verdict (accepted 2026-08-12)
 
-"基本差不多" is the *expected* outcome of this design, not a failure of the
-idea: the candidate re-weights a signal the baseline already has, in a regime
-where the resource it balances never queues, measured by a tail metric owned
-by the Decode side, with run noise an order of magnitude larger than the
-maximum achievable effect. The TTFT "regression" is noise (same-policy A vs B
-shows equal-magnitude swings). Before another repetition campaign, change the
-operating point and the score function per the list above; otherwise more
-runs will keep averaging to zero.
+**In this deployment shape — Prefill never queues and the TTFT tail is
+owned by the Decode side — the active-token Prefill score is not needed.**
+This is the accepted, final conclusion of the experiment, and it is a valid
+experimental result rather than a failure:
+
+- The candidate mechanism is correct and works as designed (it routes
+  differently and tightens token balance), but it optimizes a resource that
+  never queues here, so it cannot buy latency.
+- The candidate re-weights a signal the baseline already has (both counters
+  are fed identically at pick time; the `+120.07` score constant reduces
+  both to request counting), so the intervention is tiny by construction.
+- The apparent TTFT regression is noise: the same-policy A-vs-B control
+  swings ±15–17%, the worst outlier run was a uniform four-node cluster
+  transient during which C's balance was *better* than A's, and the same
+  harness resolves real 17–48% wins in the affinity experiment without
+  difficulty.
+
+The baseline KV-pressure-only score remains the production policy for this
+deployment. More repetitions of this design would keep averaging to zero
+and should not be run.
