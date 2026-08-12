@@ -118,6 +118,63 @@ Consequently, candidate-off is not byte-for-byte equivalent to the exact
 upstream baseline; this is why experiments include three groups rather than
 only an on/off comparison.
 
+## Affinity robustness guards
+
+Plain affinity never lets go: a bound Prefiller keeps receiving its
+session/prefix traffic regardless of load, and a binding whose KV was evicted
+is only cleared by LRU pressure. Three independent, opt-in mechanisms address
+this. All default to off, preserving the exact pre-guard behavior.
+
+### Overload escape (`--affinity-overload-factor`)
+
+On an affinity hit the scheduler compares the bound Prefiller's priority with
+the minimum priority across live Prefillers:
+
+```text
+overloaded = bound_priority > min_live_priority * factor + margin
+```
+
+If overloaded, the request overflows to the load heap (`route_source` becomes
+`session-overflow` / `prefix-overflow`) and, after a successful Prefill,
+rebinds to the node the heap picked, so the abandoned hot node loses
+ownership. The additive margin prevents false triggers when all priorities are
+near zero. `0` disables the guard; enabled values must be ≥ 1, otherwise the
+guard would flag even the least-loaded node as overloaded.
+
+### Miss-unbind (`--affinity-miss-unbind-threshold`)
+
+Every Prefill response reports `cached_tokens`. If an affinity-routed request
+observes `cached_tokens == 0` for N consecutive outcomes, the binding is
+dropped and the next request rebinds through the heap. The counter resets on
+any cache hit, and an outcome from a node the mapping no longer points at
+(for example after a mid-flight overflow rebind) is ignored so a fresh binding
+is never punished for a stale result. `0` disables miss-based unbind.
+
+### Cache-discounted reservations (`--affinity-cache-discount-alpha`)
+
+Load accounting reserves a score derived from raw prompt length, but a highly
+cached prompt costs a fraction of that compute. The bias lands exactly on the
+nodes affinity favors, so the overload guard would escape healthy bindings.
+With alpha > 0, each binding tracks an EMA of the observed
+`cached_tokens / prompt_tokens` ratio and affinity-hit reservations reserve
+compute at `max(0.1, 1 - ema)` of the full score.
+
+KV pressure is deliberately not discounted: a prefix cache hit skips
+computation, but the Decoder still needs the complete prompt KV, so
+transfer/residency cost is unchanged. The scheduler returns the effective
+reserved loads with the pick and the caller releases exactly those amounts,
+keeping accounting symmetric. The EMA lives and dies with its binding: LRU
+eviction, taint, miss-unbind, cache reset, and rebinding to a different node
+all clear it.
+
+### Observability
+
+`/healthcheck` exposes per-kind affinity stats (`hits`, `binds`, `overflows`,
+and unbind counts split by LRU / taint / miss) plus
+`prefill_cache_stats_by_source`, which aggregates `cached_tokens` and
+`prompt_tokens` per route source so guard behavior can be attributed in
+experiments.
+
 ## Reusable-prefix affinity gate
 
 With `--enable-reusable-prefix-affinity-gate`, the proxy decides whether to
