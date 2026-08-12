@@ -200,3 +200,50 @@ def test_workload_loader_rejects_non_contiguous_sequences(tmp_path: Path):
 
     with pytest.raises(ValueError, match="contiguous"):
         load_workload_jsonl(path)
+
+
+def test_session_zipf_skews_measure_turns_and_is_reproducible():
+    profile = session_profile()
+    profile["data"]["zipf_alpha"] = 1.5
+    profile["data"]["turns"] = 3
+    profile["data"]["sessions"] = 8
+
+    first = generate_workload(profile, TokenTextFactory())
+    second = generate_workload(profile, TokenTextFactory())
+    assert first == second
+
+    fill = [record for record in first if record.turn == 0]
+    measure = [record for record in first if record.turn > 0]
+    assert len(fill) == 8
+    assert len({record.session_index for record in fill}) == 8
+    assert len(measure) == 16
+    counts = {}
+    for record in measure:
+        counts[record.session_index] = counts.get(record.session_index, 0) + 1
+    assert max(counts.values()) > min(counts.values())
+
+
+def test_shared_prefix_zipf_skews_stage_groups_and_is_reproducible():
+    profile = shared_prefix_profile()
+    profile["data"]["zipf_alpha"] = 1.5
+    profile["data"]["num_groups"] = 6
+    profile["load"]["stages"] = [{"name": "qps-40", "rate": 40, "duration": 2}]
+
+    first = generate_workload(profile, TokenTextFactory())
+    second = generate_workload(profile, TokenTextFactory())
+    assert first == second
+
+    stage = [record for record in first if record.stage == "qps-40"]
+    assert stage
+    groups = [record.session_index // profile["data"]["prompts_per_group"] for record in stage]
+    counts = {}
+    for group in groups:
+        counts[group] = counts.get(group, 0) + 1
+    assert max(counts.values()) > min(counts.values())
+
+
+def test_zipf_alpha_must_be_positive():
+    profile = session_profile()
+    profile["data"]["zipf_alpha"] = 0
+    with pytest.raises(ValueError, match="zipf_alpha"):
+        generate_workload(profile, TokenTextFactory())

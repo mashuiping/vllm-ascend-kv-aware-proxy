@@ -128,6 +128,25 @@ def _positive_int(value: Any, name: str) -> int:
     return result
 
 
+def _optional_zipf_alpha(data: dict[str, Any]) -> float | None:
+    if "zipf_alpha" not in data or data["zipf_alpha"] is None:
+        return None
+    alpha = float(data["zipf_alpha"])
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("data.zipf_alpha must be a finite positive number")
+    return alpha
+
+
+def _zipf_weights(n: int, alpha: float) -> list[float]:
+    return [1.0 / ((index + 1) ** alpha) for index in range(n)]
+
+
+def _zipf_sample_indices(rng: random.Random, n: int, alpha: float, k: int) -> list[int]:
+    if n <= 0 or k <= 0:
+        raise ValueError("zipf sampling requires positive n and k")
+    return rng.choices(range(n), weights=_zipf_weights(n, alpha), k=k)
+
+
 def _request_settings(profile: dict[str, Any]) -> tuple[int, float]:
     request = profile.get("request") or {}
     return _positive_int(request.get("max_tokens", 32), "request.max_tokens"), float(request.get("temperature", 0.0))
@@ -144,6 +163,7 @@ def generate_session_workload(
     system_tokens = _positive_int(data.get("system_prompt_tokens"), "data.system_prompt_tokens")
     turn_tokens = _positive_int(data.get("turn_input_tokens"), "data.turn_input_tokens")
     fixed_assistant = str(data.get("fixed_assistant_text", "Acknowledged."))
+    zipf_alpha = _optional_zipf_alpha(data)
     max_tokens, temperature = _request_settings(profile)
     scenario = str(profile["scenario"])
     rng = random.Random(seed)
@@ -162,8 +182,13 @@ def generate_session_workload(
         )
 
     for turn in range(turns):
-        order = list(range(sessions))
-        rng.shuffle(order)
+        if zipf_alpha is None or turn == 0:
+            # Turn 0 always covers every session once so affinity bindings exist
+            # before Zipf skew concentrates later traffic onto hot sessions.
+            order = list(range(sessions))
+            rng.shuffle(order)
+        else:
+            order = _zipf_sample_indices(rng, sessions, zipf_alpha, sessions)
         for session_index in order:
             records.append(
                 PlannedRequest(
@@ -226,6 +251,7 @@ def generate_shared_prefix_workload(
         raise ValueError("data.cache_fill_prompts_per_group cannot exceed data.prompts_per_group")
     system_tokens = _positive_int(data.get("system_prompt_tokens"), "data.system_prompt_tokens")
     question_tokens = _positive_int(data.get("question_tokens"), "data.question_tokens")
+    zipf_alpha = _optional_zipf_alpha(data)
     cache_fill_rate = float(load.get("cache_fill_rate", 10.0))
     prefix_probe_rate = float(load.get("prefix_probe_rate", 0.0))
     if prefix_probe_rate < 0:
@@ -239,6 +265,7 @@ def generate_shared_prefix_workload(
     rng = random.Random(seed)
 
     corpus: list[tuple[int, int, list[dict[str, str]]]] = []
+    corpus_by_key: dict[tuple[int, int], list[dict[str, str]]] = {}
     for group_index in range(groups):
         system = text_factory.make(f"shared-group-{seed}-{group_index}-system", system_tokens)
         for prompt_index in range(prompts_per_group):
@@ -246,16 +273,12 @@ def generate_shared_prefix_workload(
                 f"shared-group-{seed}-{group_index}-question-{prompt_index}",
                 question_tokens,
             )
-            corpus.append(
-                (
-                    group_index,
-                    prompt_index,
-                    [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": question},
-                    ],
-                )
-            )
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": question},
+            ]
+            corpus.append((group_index, prompt_index, messages))
+            corpus_by_key[(group_index, prompt_index)] = messages
 
     records: list[PlannedRequest] = []
     sequence = 0
@@ -316,7 +339,12 @@ def generate_shared_prefix_workload(
         order = list(corpus)
         rng.shuffle(order)
         for request_index, offset in enumerate(offsets):
-            group_index, prompt_index, messages = order[request_index % len(order)]
+            if zipf_alpha is None:
+                group_index, prompt_index, messages = order[request_index % len(order)]
+            else:
+                group_index = _zipf_sample_indices(stage_rng, groups, zipf_alpha, 1)[0]
+                prompt_index = stage_rng.randrange(prompts_per_group)
+                messages = corpus_by_key[(group_index, prompt_index)]
             records.append(
                 PlannedRequest(
                     sequence=sequence,

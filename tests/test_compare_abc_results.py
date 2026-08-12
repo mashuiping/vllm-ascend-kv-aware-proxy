@@ -34,8 +34,16 @@ def write_group(root: Path, group: str, workload_hash: str, ttft: float) -> None
 def add_identity(root: Path, group: str, source_hash: str, *, mode: str = "affinity") -> None:
     config_path = root / group / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    variant = "baseline" if group == "baseline" else "candidate"
-    kv_aware = "true" if mode == "affinity" and group == "candidate-on" else "false"
+    if mode == "affinity-guard":
+        variant = "candidate"
+        kv_aware = "true"
+        overload_factor = "1.5" if group == "candidate-on" else "0"
+        miss_unbind_threshold = "3" if group == "candidate-on" else "0"
+    else:
+        variant = "baseline" if group == "baseline" else "candidate"
+        kv_aware = "true" if mode == "affinity" and group == "candidate-on" else "false"
+        overload_factor = "0"
+        miss_unbind_threshold = "0"
     active_weight = "0" if mode == "active-token" and group == "candidate-off" else "1.0"
     config["proxy_identity"] = {
         "group": group,
@@ -46,6 +54,10 @@ def add_identity(root: Path, group: str, source_hash: str, *, mode: str = "affin
         "actual_kv_aware": kv_aware,
         "expected_active_token_weight": active_weight,
         "actual_active_token_weight": active_weight,
+        "expected_affinity_overload_factor": overload_factor,
+        "actual_affinity_overload_factor": overload_factor,
+        "expected_affinity_miss_unbind_threshold": miss_unbind_threshold,
+        "actual_affinity_miss_unbind_threshold": miss_unbind_threshold,
         "expected_source_sha256": source_hash,
         "actual_source_sha256": source_hash,
     }
@@ -122,3 +134,31 @@ def test_build_comparison_accepts_active_token_isolation_semantics(tmp_path: Pat
 
     assert comparison["valid"] is True
     assert comparison["validity"]["proxy_identity"]["comparison_mode_semantics_match"] is True
+
+
+def test_build_comparison_accepts_affinity_guard_semantics(tmp_path: Path):
+    for group in ("baseline", "candidate-off", "candidate-on"):
+        write_group(tmp_path, group, "same-hash", 100)
+        add_identity(tmp_path, group, "candidate-source", mode="affinity-guard")
+
+    comparison = build_comparison(tmp_path)
+
+    assert comparison["valid"] is True
+    assert comparison["validity"]["proxy_identity"]["baseline_differs_from_candidate"] is True
+    assert comparison["validity"]["proxy_identity"]["comparison_mode_semantics_match"] is True
+
+
+def test_build_comparison_rejects_affinity_guard_without_guards_on_c(tmp_path: Path):
+    for group in ("baseline", "candidate-off", "candidate-on"):
+        write_group(tmp_path, group, "same-hash", 100)
+        add_identity(tmp_path, group, "candidate-source", mode="affinity-guard")
+    config_path = tmp_path / "candidate-on" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["proxy_identity"]["actual_affinity_overload_factor"] = "0"
+    config["proxy_identity"]["actual_affinity_miss_unbind_threshold"] = "0"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    comparison = build_comparison(tmp_path)
+
+    assert comparison["valid"] is False
+    assert comparison["validity"]["proxy_identity"]["comparison_mode_semantics_match"] is False

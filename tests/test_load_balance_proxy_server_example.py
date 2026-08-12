@@ -309,7 +309,7 @@ def test_affinity_priority_is_session_then_prefix_then_heap():
     scheduler.release_prefill_kv(prefix_hit["key"], 10.0)
 
     other_key = next(key for key in scheduler.prefillers if key != first["key"])
-    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "other-prefix", other_key, 1)
+    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "other-prefix", other_key, 1, kind="prefix")
     session_hit = scheduler.reserve_prefill_kv(10.0, 10.0, "new-session", "other-prefix")
     assert session_hit["key"] == first["key"]
     assert session_hit["route_source"] == "session"
@@ -359,22 +359,26 @@ def test_affinity_lru_eviction_removal_and_reset():
     scheduler = make_scheduler(session_lru_size=1, prefix_lru_size=1)
     keys = list(scheduler.prefillers)
 
-    scheduler._bind_affinity_no_lock(scheduler.session_lru, "old", keys[0], 1)
-    scheduler._bind_affinity_no_lock(scheduler.session_lru, "new", keys[1], 1)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "old", keys[0], 1, kind="session")
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "new", keys[1], 1, kind="session")
     assert list(scheduler.session_lru) == ["new"]
+    assert scheduler.session_affinity_stats["unbinds_lru"] == 1
 
-    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "old-prefix", keys[0], 1)
-    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "new-prefix", keys[1], 1)
+    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "old-prefix", keys[0], 1, kind="prefix")
+    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "new-prefix", keys[1], 1, kind="prefix")
     assert list(scheduler.prefix_lru) == ["new-prefix"]
+    assert scheduler.prefix_affinity_stats["unbinds_lru"] == 1
 
     scheduler.remove_instances(proxy.ServerRole.PREFILL, [("127.0.0.1", 8101)])
     assert scheduler.session_lru == {}
     assert scheduler.prefix_lru == {}
 
-    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 1)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 1, kind="session")
     scheduler.clear_affinity_caches()
     assert scheduler.session_lru == {}
     assert scheduler.prefix_lru == {}
+    assert scheduler.session_miss_streak == {}
+    assert scheduler.prefix_miss_streak == {}
 
 
 def test_reset_prefix_cache_reports_every_prefill(monkeypatch):
@@ -727,3 +731,190 @@ def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monk
     )
     assert s_key in scheduler.session_lru
     assert any("reusable_prefix_tokens" in record.getMessage() for record in caplog.records)
+
+
+def test_affinity_overload_factor_zero_preserves_bound_prefiller():
+    scheduler = make_scheduler(affinity_overload_factor=0.0)
+    first = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
+    bound = first["key"]
+    other = next(key for key in scheduler.prefillers if key != bound)
+    scheduler.prefillers[bound].active_kv_cache = 10_000.0
+    scheduler.prefillers[other].active_kv_cache = 0.0
+
+    hit = scheduler.begin_request(1.0, 1.0, "session")
+    assert hit["route_source"] == "session"
+    assert hit["key"] == bound
+    assert scheduler.session_affinity_stats["hits"] == 1
+    assert scheduler.session_affinity_stats["overflows"] == 0
+    scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
+
+
+def test_affinity_overload_guard_escapes_and_rebinds():
+    scheduler = make_scheduler(affinity_overload_factor=1.5)
+    first = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
+    bound = first["key"]
+    other = next(key for key in scheduler.prefillers if key != bound)
+    # Bound node carries high KV pressure; the idle peer is the escape target.
+    scheduler.prefillers[bound].active_tokens = 0.0
+    scheduler.prefillers[bound].active_kv_cache = 10_000.0
+    scheduler.prefillers[other].active_tokens = 0.0
+    scheduler.prefillers[other].active_kv_cache = 0.0
+    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
+
+    escaped = scheduler.begin_request(1.0, 1.0, "session")
+    assert escaped["route_source"] == "session-overflow"
+    assert escaped["key"] == other
+    assert scheduler.session_affinity_stats["hits"] == 1
+    assert scheduler.session_affinity_stats["overflows"] == 1
+    scheduler.complete_prefill(escaped["key"], 1.0, "session", None, route_source="session-overflow")
+    assert scheduler.session_lru["session"] == other
+
+
+def test_affinity_overload_does_not_trigger_near_zero_priorities():
+    scheduler = make_scheduler(affinity_overload_factor=1.5)
+    first = scheduler.begin_request(1.0, 1.0, "session")
+    scheduler.complete_prefill(first["key"], 1.0, "session", None, route_source="heap")
+    bound = first["key"]
+
+    hit = scheduler.begin_request(1.0, 1.0, "session")
+    assert hit["route_source"] == "session"
+    assert hit["key"] == bound
+    assert scheduler.session_affinity_stats["overflows"] == 0
+    scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
+
+
+def test_affinity_miss_unbind_requires_consecutive_zero_cached_tokens():
+    scheduler = make_scheduler(affinity_miss_unbind_threshold=2)
+    first = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
+    bound = first["key"]
+
+    hit = scheduler.begin_request(1.0, 1.0, "session")
+    assert hit["route_source"] == "session"
+    scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
+    scheduler.observe_affinity_outcome("session", "session", 0, 100)
+    assert scheduler.session_lru["session"] == bound
+    assert scheduler.session_miss_streak["session"] == 1
+
+    hit2 = scheduler.begin_request(1.0, 1.0, "session")
+    assert hit2["route_source"] == "session"
+    scheduler.complete_prefill(hit2["key"], 1.0, "session", None, route_source="session")
+    scheduler.observe_affinity_outcome("session", "session", 0, 100)
+    assert "session" not in scheduler.session_lru
+    assert scheduler.session_affinity_stats["unbinds_miss"] == 1
+
+
+def test_affinity_miss_unbind_resets_on_cache_hit_and_threshold_zero_disables():
+    scheduler = make_scheduler(affinity_miss_unbind_threshold=2)
+    first = scheduler.begin_request(10.0, 10.0, "session")
+    scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
+
+    hit = scheduler.begin_request(1.0, 1.0, "session")
+    scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
+    scheduler.observe_affinity_outcome("session", "session", 0, 100)
+    scheduler.observe_affinity_outcome("session", "session", 5, 100)
+    assert scheduler.session_miss_streak["session"] == 0
+    assert "session" in scheduler.session_lru
+
+    disabled = make_scheduler(affinity_miss_unbind_threshold=0)
+    first = disabled.begin_request(10.0, 10.0, "session")
+    disabled.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
+    for _ in range(5):
+        hit = disabled.begin_request(1.0, 1.0, "session")
+        disabled.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
+        disabled.observe_affinity_outcome("session", "session", 0, 100)
+    assert "session" in disabled.session_lru
+    assert disabled.session_affinity_stats["unbinds_miss"] == 0
+
+
+def test_healthcheck_exposes_affinity_stats_and_cache_by_source():
+    scheduler = make_scheduler(affinity_miss_unbind_threshold=1)
+    first = scheduler.begin_request(10.0, 10.0, "session", "prefix")
+    scheduler.complete_prefill(first["key"], 10.0, "session", "prefix", route_source="heap")
+    hit = scheduler.begin_request(1.0, 1.0, "session")
+    scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
+    scheduler.observe_affinity_outcome("session", "session", 12, 40)
+
+    health = scheduler.healthcheck()
+    assert health["affinity_overload_factor"] == 0.0
+    assert health["affinity_miss_unbind_threshold"] == 1
+    assert health["session_affinity_stats"]["hits"] >= 1
+    assert health["session_affinity_stats"]["binds"] >= 1
+    assert health["prefix_affinity_stats"]["binds"] >= 1
+    assert health["prefill_cache_stats_by_source"]["session"]["cached_tokens"] == 12
+    assert health["prefill_cache_stats_by_source"]["session"]["prompt_tokens"] == 40
+    assert health["prefill_cache_stats_by_source"]["session"]["requests"] == 1
+
+
+def test_prefix_affinity_overload_guard_escapes_and_rebinds():
+    scheduler = make_scheduler(affinity_overload_factor=1.5)
+    first = scheduler.begin_request(10.0, 10.0, None, "prefix")
+    scheduler.complete_prefill(first["key"], 10.0, None, "prefix", route_source="heap")
+    bound = first["key"]
+    other = next(key for key in scheduler.prefillers if key != bound)
+    scheduler.prefillers[bound].active_tokens = 0.0
+    scheduler.prefillers[bound].active_kv_cache = 10_000.0
+    scheduler.prefillers[other].active_tokens = 0.0
+    scheduler.prefillers[other].active_kv_cache = 0.0
+    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
+
+    escaped = scheduler.begin_request(1.0, 1.0, None, "prefix")
+    assert escaped["route_source"] == "prefix-overflow"
+    assert escaped["key"] == other
+    assert scheduler.prefix_affinity_stats["hits"] == 1
+    assert scheduler.prefix_affinity_stats["overflows"] == 1
+    scheduler.complete_prefill(escaped["key"], 1.0, None, "prefix", route_source="prefix-overflow")
+    assert scheduler.prefix_lru["prefix"] == other
+
+
+def test_miss_unbind_ignores_outcome_from_node_mapping_no_longer_points_at():
+    scheduler = make_scheduler(affinity_miss_unbind_threshold=1)
+    keys = list(scheduler.prefillers)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 4, kind="session")
+
+    # Outcome served by keys[1], but the mapping was rebound to keys[0]
+    # mid-flight: the stale zero-cache result must not unbind the new owner.
+    scheduler.observe_affinity_outcome("session", "session", 0, 100, prefiller_key=keys[1])
+    assert scheduler.session_lru["session"] == keys[0]
+    assert scheduler.session_affinity_stats["unbinds_miss"] == 0
+
+    # The same outcome from the currently bound node still counts.
+    scheduler.observe_affinity_outcome("session", "session", 0, 100, prefiller_key=keys[0])
+    assert "session" not in scheduler.session_lru
+    assert scheduler.session_affinity_stats["unbinds_miss"] == 1
+
+
+def test_prune_affinity_clears_miss_streaks_and_counts_taint_unbinds():
+    scheduler = make_scheduler(affinity_miss_unbind_threshold=5)
+    keys = list(scheduler.prefillers)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 4, kind="session")
+    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "prefix", keys[0], 4, kind="prefix")
+    scheduler.observe_affinity_outcome("session", "session", 0, 100, prefiller_key=keys[0])
+    assert scheduler.session_miss_streak["session"] == 1
+
+    scheduler._prune_affinity_no_lock({keys[0]})
+    assert scheduler.session_lru == {}
+    assert scheduler.prefix_lru == {}
+    assert scheduler.session_miss_streak == {}
+    assert scheduler.session_affinity_stats["unbinds_taint"] == 1
+    assert scheduler.prefix_affinity_stats["unbinds_taint"] == 1
+
+
+def test_parse_args_rejects_overload_factor_between_zero_and_one(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["load_balance_proxy_server_example.py", "--affinity-overload-factor", "0.5"],
+    )
+    with pytest.raises(ValueError, match="0 \\(disabled\\) or >= 1"):
+        proxy.parse_args()
+
+    for valid_value in ("0", "1", "1.5"):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["load_balance_proxy_server_example.py", "--affinity-overload-factor", valid_value],
+        )
+        assert proxy.parse_args().affinity_overload_factor == float(valid_value)

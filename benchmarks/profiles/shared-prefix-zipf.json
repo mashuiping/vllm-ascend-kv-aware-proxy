@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "name": "shared-prefix-zipf",
+  "scenario": "shared-prefix",
+  "seed": 20260724,
+  "data": {
+    "num_groups": 32,
+    "prompts_per_group": 8,
+    "cache_fill_prompts_per_group": 1,
+    "system_prompt_tokens": 2048,
+    "question_tokens": 256,
+    "zipf_alpha": 1.2
+  },
+  "load": {
+    "type": "poisson",
+    "concurrency": 64,
+    "cache_fill_rate": 10,
+    "prefix_probe_rate": 10,
+    "stages": [
+      {"name": "qps-2", "rate": 2, "duration": 30},
+      {"name": "qps-5", "rate": 5, "duration": 30},
+      {"name": "qps-10", "rate": 10, "duration": 45},
+      {"name": "qps-20", "rate": 20, "duration": 45}
+    ]
+  },
+  "request": {
+    "max_tokens": 32,
+    "temperature": 0.0
+  }
+}

@@ -87,12 +87,17 @@ if [[ "${comparison_mode}" == "auto" ]]; then
   fi
 fi
 case "${comparison_mode}" in
-  affinity|active-token) ;;
+  affinity|active-token|affinity-guard) ;;
   *)
-    echo "ABC_COMPARISON_MODE must be auto, affinity, or active-token: ${comparison_mode}" >&2
+    echo "ABC_COMPARISON_MODE must be auto, affinity, active-token, or affinity-guard: ${comparison_mode}" >&2
     exit 2
     ;;
 esac
+
+# Guard settings apply to candidate-on only in affinity-guard mode. Defaults
+# enable both mechanisms so the C group exercises escape and miss-unbind.
+guard_overload_factor="${AFFINITY_OVERLOAD_FACTOR:-1.5}"
+guard_miss_unbind_threshold="${AFFINITY_MISS_UNBIND_THRESHOLD:-3}"
 decoder_count="${BENCHMARK_DECODER_COUNT:-${profile_decoder_count}}"
 sample_interval="${SAMPLE_INTERVAL:-${profile_sample_interval}}"
 case "${decoder_count}" in
@@ -172,16 +177,30 @@ deploy_proxy_group() {
   local kv_aware
   local proxy_source
   local active_token_weight="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
+  local overload_factor=0
+  local miss_unbind_threshold=0
   case "${group}" in
     baseline)
-      proxy_variant=baseline
-      kv_aware=false
-      proxy_source="${BASELINE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+        # affinity-guard compares the candidate affinity policy against itself
+        # with guards enabled; the upstream baseline source plays no role.
+        proxy_variant=candidate
+        kv_aware=true
+        proxy_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      else
+        proxy_variant=baseline
+        kv_aware=false
+        proxy_source="${BASELINE_PROXY_SOURCE_PATH}"
+      fi
       ;;
     candidate-off)
       proxy_variant=candidate
-      kv_aware=false
       proxy_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+        kv_aware=true
+      else
+        kv_aware=false
+      fi
       if [[ "${comparison_mode}" == "active-token" ]]; then
         active_token_weight=0
       fi
@@ -194,15 +213,21 @@ deploy_proxy_group() {
         kv_aware=true
       fi
       proxy_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+        overload_factor="${guard_overload_factor}"
+        miss_unbind_threshold="${guard_miss_unbind_threshold}"
+      fi
       ;;
     *)
       echo "unknown group: ${group}; expected baseline, candidate-off, or candidate-on" >&2
       return 2
       ;;
   esac
-  log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware} decoder_count=${decoder_count}"
+  log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware} decoder_count=${decoder_count} overload_factor=${overload_factor} miss_unbind_threshold=${miss_unbind_threshold}"
   PROXY_VARIANT="${proxy_variant}" KV_AWARE_ROUTING="${kv_aware}" PROXY_DECODER_COUNT="${decoder_count}" \
     PREFILL_ACTIVE_TOKEN_WEIGHT="${active_token_weight}" \
+    AFFINITY_OVERLOAD_FACTOR="${overload_factor}" \
+    AFFINITY_MISS_UNBIND_THRESHOLD="${miss_unbind_threshold}" \
     PROXY_SOURCE_PATH="${proxy_source}" \
     bash "${DEPLOY_DIR}/deploy.sh" proxy
 }
@@ -239,17 +264,28 @@ build_metadata_json() {
 verify_proxy_group() {
   local group="$1"
   local expected_variant expected_kv_aware expected_source expected_active_token_weight
+  local expected_overload_factor=0 expected_miss_unbind_threshold=0
   expected_active_token_weight="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
   case "${group}" in
     baseline)
-      expected_variant=baseline
-      expected_kv_aware=false
-      expected_source="${BASELINE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+        expected_variant=candidate
+        expected_kv_aware=true
+        expected_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      else
+        expected_variant=baseline
+        expected_kv_aware=false
+        expected_source="${BASELINE_PROXY_SOURCE_PATH}"
+      fi
       ;;
     candidate-off)
       expected_variant=candidate
-      expected_kv_aware=false
       expected_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+        expected_kv_aware=true
+      else
+        expected_kv_aware=false
+      fi
       if [[ "${comparison_mode}" == "active-token" ]]; then
         expected_active_token_weight=0
       fi
@@ -262,30 +298,37 @@ verify_proxy_group() {
         expected_kv_aware=true
       fi
       expected_source="${CANDIDATE_PROXY_SOURCE_PATH}"
+      if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+        expected_overload_factor="${guard_overload_factor}"
+        expected_miss_unbind_threshold="${guard_miss_unbind_threshold}"
+      fi
       ;;
   esac
 
   local pod_name expected_sha actual_sha actual_variant actual_kv_aware actual_active_token_weight pod_uid image_id
+  local actual_overload_factor actual_miss_unbind_threshold
   pod_name="$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=pd-proxy \
     --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}')"
   [[ -n "${pod_name}" ]] || { echo "${group}: no proxy pod found" >&2; return 1; }
   expected_sha="$(sha256_file "${expected_source}")"
   actual_sha="$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
     'import hashlib, pathlib; print(hashlib.sha256(pathlib.Path("/opt/pd-proxy/load_balance_proxy_server_example.py").read_bytes()).hexdigest())')"
-  read -r actual_variant actual_kv_aware actual_active_token_weight < <(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
-    'import os; print(os.environ.get("PROXY_VARIANT", ""), os.environ.get("KV_AWARE_ROUTING", ""), os.environ.get("PREFILL_ACTIVE_TOKEN_WEIGHT", ""))')
+  read -r actual_variant actual_kv_aware actual_active_token_weight actual_overload_factor actual_miss_unbind_threshold < <(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
+    'import os; print(os.environ.get("PROXY_VARIANT", ""), os.environ.get("KV_AWARE_ROUTING", ""), os.environ.get("PREFILL_ACTIVE_TOKEN_WEIGHT", ""), os.environ.get("AFFINITY_OVERLOAD_FACTOR", "0"), os.environ.get("AFFINITY_MISS_UNBIND_THRESHOLD", "0"))')
   pod_uid="$(kubectl -n "${NAMESPACE}" get pod "${pod_name}" -o jsonpath='{.metadata.uid}')"
   image_id="$(kubectl -n "${NAMESPACE}" get pod "${pod_name}" -o jsonpath='{.status.containerStatuses[?(@.name=="proxy")].imageID}')"
 
-  if [[ "${actual_sha}" != "${expected_sha}" || "${actual_variant}" != "${expected_variant}" || "${actual_kv_aware}" != "${expected_kv_aware}" || "${actual_active_token_weight}" != "${expected_active_token_weight}" ]]; then
-    echo "${group}: proxy identity mismatch expected=${expected_variant}/${expected_kv_aware}/weight-${expected_active_token_weight}/${expected_sha} actual=${actual_variant}/${actual_kv_aware}/weight-${actual_active_token_weight}/${actual_sha}" >&2
+  if [[ "${actual_sha}" != "${expected_sha}" || "${actual_variant}" != "${expected_variant}" || "${actual_kv_aware}" != "${expected_kv_aware}" || "${actual_active_token_weight}" != "${expected_active_token_weight}" || "${actual_overload_factor}" != "${expected_overload_factor}" || "${actual_miss_unbind_threshold}" != "${expected_miss_unbind_threshold}" ]]; then
+    echo "${group}: proxy identity mismatch expected=${expected_variant}/${expected_kv_aware}/weight-${expected_active_token_weight}/guard-${expected_overload_factor}-${expected_miss_unbind_threshold}/${expected_sha} actual=${actual_variant}/${actual_kv_aware}/weight-${actual_active_token_weight}/guard-${actual_overload_factor}-${actual_miss_unbind_threshold}/${actual_sha}" >&2
     return 1
   fi
 
   "${PYTHON_BIN}" -c \
-    'import json,sys; print(json.dumps(dict(zip(("group","comparison_mode","expected_variant","actual_variant","expected_kv_aware","actual_kv_aware","expected_active_token_weight","actual_active_token_weight","expected_source_sha256","actual_source_sha256","pod_name","pod_uid","image_id"), sys.argv[1:])), separators=(",", ":")))' \
+    'import json,sys; print(json.dumps(dict(zip(("group","comparison_mode","expected_variant","actual_variant","expected_kv_aware","actual_kv_aware","expected_active_token_weight","actual_active_token_weight","expected_affinity_overload_factor","actual_affinity_overload_factor","expected_affinity_miss_unbind_threshold","actual_affinity_miss_unbind_threshold","expected_source_sha256","actual_source_sha256","pod_name","pod_uid","image_id"), sys.argv[1:])), separators=(",", ":")))' \
     "${group}" "${comparison_mode}" "${expected_variant}" "${actual_variant}" "${expected_kv_aware}" "${actual_kv_aware}" \
     "${expected_active_token_weight}" "${actual_active_token_weight}" \
+    "${expected_overload_factor}" "${actual_overload_factor}" \
+    "${expected_miss_unbind_threshold}" "${actual_miss_unbind_threshold}" \
     "${expected_sha}" "${actual_sha}" "${pod_name}" "${pod_uid}" "${image_id}"
 }
 

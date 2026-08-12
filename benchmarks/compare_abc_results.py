@@ -77,18 +77,38 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
             baseline_hash = identities["baseline"].get("actual_source_sha256")
             candidate_off_hash = identities["candidate-off"].get("actual_source_sha256")
             candidate_on_hash = identities["candidate-on"].get("actual_source_sha256")
-            identity_checks["baseline_differs_from_candidate"] = bool(
-                baseline_hash and candidate_off_hash and baseline_hash != candidate_off_hash
-            )
+            comparison_mode = identities["baseline"].get("comparison_mode")
+            if comparison_mode == "affinity-guard":
+                # All three groups run the candidate source; only the guard
+                # parameters differ, so a distinct baseline source is wrong here.
+                identity_checks["baseline_differs_from_candidate"] = bool(
+                    baseline_hash and candidate_off_hash and baseline_hash == candidate_off_hash
+                )
+            else:
+                identity_checks["baseline_differs_from_candidate"] = bool(
+                    baseline_hash and candidate_off_hash and baseline_hash != candidate_off_hash
+                )
             identity_checks["candidate_groups_match"] = bool(
                 candidate_off_hash and candidate_off_hash == candidate_on_hash
             )
-            comparison_mode = identities["baseline"].get("comparison_mode")
             try:
                 off_weight = float(identities["candidate-off"].get("actual_active_token_weight"))
                 on_weight = float(identities["candidate-on"].get("actual_active_token_weight"))
             except (TypeError, ValueError):
                 off_weight = on_weight = -1.0
+
+            def guard_values(group: str) -> tuple[float, float]:
+                identity = identities[group]
+                try:
+                    factor = float(identity.get("actual_affinity_overload_factor"))
+                except (TypeError, ValueError):
+                    factor = -1.0
+                try:
+                    threshold = float(identity.get("actual_affinity_miss_unbind_threshold"))
+                except (TypeError, ValueError):
+                    threshold = -1.0
+                return factor, threshold
+
             if comparison_mode == "active-token":
                 identity_checks["comparison_mode_semantics_match"] = (
                     identities["baseline"].get("actual_variant") == "baseline"
@@ -104,6 +124,18 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
                     identities["candidate-off"].get("actual_kv_aware") == "false"
                     and identities["candidate-on"].get("actual_kv_aware") == "true"
                     and off_weight == on_weight
+                )
+            elif comparison_mode == "affinity-guard":
+                baseline_guards = guard_values("baseline")
+                off_guards = guard_values("candidate-off")
+                on_guards = guard_values("candidate-on")
+                identity_checks["comparison_mode_semantics_match"] = (
+                    all(identities[group].get("actual_variant") == "candidate" for group in GROUPS)
+                    and all(identities[group].get("actual_kv_aware") == "true" for group in GROUPS)
+                    and off_weight == on_weight
+                    and baseline_guards == (0.0, 0.0)
+                    and off_guards == (0.0, 0.0)
+                    and (on_guards[0] > 0.0 or on_guards[1] > 0.0)
                 )
             else:
                 identity_checks["comparison_mode_semantics_match"] = False

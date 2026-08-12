@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "name": "shared-prefix-capacity-pressure",
+  "scenario": "shared-prefix",
+  "seed": 20260724,
+  "data": {
+    "num_groups": 96,
+    "prompts_per_group": 4,
+    "cache_fill_prompts_per_group": 1,
+    "system_prompt_tokens": 8192,
+    "question_tokens": 256
+  },
+  "load": {
+    "type": "poisson",
+    "concurrency": 64,
+    "cache_fill_rate": 8,
+    "prefix_probe_rate": 8,
+    "stages": [
+      {"name": "qps-2", "rate": 2, "duration": 30},
+      {"name": "qps-5", "rate": 5, "duration": 45},
+      {"name": "qps-10", "rate": 10, "duration": 60},
+      {"name": "qps-20", "rate": 20, "duration": 60}
+    ]
+  },
+  "request": {
+    "max_tokens": 32,
+    "temperature": 0.0
+  }
+}

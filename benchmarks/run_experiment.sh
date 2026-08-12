@@ -21,15 +21,30 @@ log() {
   printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
 }
 
+guard_overload_factor="${AFFINITY_OVERLOAD_FACTOR:-1.5}"
+guard_miss_unbind_threshold="${AFFINITY_MISS_UNBIND_THRESHOLD:-3}"
+export AFFINITY_OVERLOAD_FACTOR=0
+export AFFINITY_MISS_UNBIND_THRESHOLD=0
+
 case "${GROUP}" in
   baseline)
-    export PROXY_VARIANT=baseline
-    export KV_AWARE_ROUTING=false
-    export PROXY_SOURCE_PATH="${BASELINE_PROXY_SOURCE_PATH:-${REPO_ROOT}/baseline/load_balance_proxy_server_example.py}"
+    if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+      export PROXY_VARIANT=candidate
+      export KV_AWARE_ROUTING=true
+      export PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH:-${REPO_ROOT}/load_balance_proxy_server_example.py}"
+    else
+      export PROXY_VARIANT=baseline
+      export KV_AWARE_ROUTING=false
+      export PROXY_SOURCE_PATH="${BASELINE_PROXY_SOURCE_PATH:-${REPO_ROOT}/baseline/load_balance_proxy_server_example.py}"
+    fi
     ;;
   candidate-off)
     export PROXY_VARIANT=candidate
-    export KV_AWARE_ROUTING=false
+    if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+      export KV_AWARE_ROUTING=true
+    else
+      export KV_AWARE_ROUTING=false
+    fi
     export PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH:-${REPO_ROOT}/load_balance_proxy_server_example.py}"
     if [[ "${comparison_mode}" == "active-token" ]]; then
       export PREFILL_ACTIVE_TOKEN_WEIGHT=0
@@ -43,6 +58,10 @@ case "${GROUP}" in
       export KV_AWARE_ROUTING=true
     fi
     export PROXY_SOURCE_PATH="${CANDIDATE_PROXY_SOURCE_PATH:-${REPO_ROOT}/load_balance_proxy_server_example.py}"
+    if [[ "${comparison_mode}" == "affinity-guard" ]]; then
+      export AFFINITY_OVERLOAD_FACTOR="${guard_overload_factor}"
+      export AFFINITY_MISS_UNBIND_THRESHOLD="${guard_miss_unbind_threshold}"
+    fi
     ;;
   *)
     echo "unknown group: ${GROUP}; expected baseline, candidate-off, or candidate-on" >&2

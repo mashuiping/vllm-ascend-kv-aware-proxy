@@ -192,6 +192,8 @@ SESSION_HEADER_NAMES: tuple[str, ...] = (
     "session_id",
 )
 PREFIX_HASH_VERSION = "pd-prefix-v1"
+# Absolute slack so near-zero priorities do not false-trigger overload escape.
+AFFINITY_OVERLOAD_MARGIN = 1.0
 
 
 def extract_cached_tokens(response_json: dict) -> int | None:
@@ -498,6 +500,8 @@ class SharedProxyScheduler:
         session_lru_size: int = 4096,
         prefix_lru_size: int = 1024,
         prefill_active_token_weight: float = 1.0,
+        affinity_overload_factor: float = 0.0,
+        affinity_miss_unbind_threshold: int = 0,
     ):
         self._lock = threading.RLock()
         self.request_num = 0
@@ -510,19 +514,37 @@ class SharedProxyScheduler:
         self.session_lru_size = max(0, int(session_lru_size))
         self.prefix_lru_size = max(0, int(prefix_lru_size))
         self.prefill_active_token_weight = max(0.0, float(prefill_active_token_weight))
+        self.affinity_overload_factor = max(0.0, float(affinity_overload_factor))
+        self.affinity_miss_unbind_threshold = max(0, int(affinity_miss_unbind_threshold))
         self.session_lru: OrderedDict[str, str] = OrderedDict()
         self.prefix_lru: OrderedDict[str, str] = OrderedDict()
+        self.session_miss_streak: dict[str, int] = {}
+        self.prefix_miss_streak: dict[str, int] = {}
         self.prefill_routing_stats = {
             "heap_decisions": 0,
             "shadow_baseline_active_divergences": 0,
             "actual_differs_from_baseline": 0,
             "actual_differs_from_active": 0,
         }
+        self.session_affinity_stats = self._empty_affinity_stats()
+        self.prefix_affinity_stats = self._empty_affinity_stats()
+        self.prefill_cache_stats_by_source: dict[str, dict[str, int]] = {}
 
         for host, port in prefiller_instances:
             self._add_server_no_lock(ServerRole.PREFILL, host, port)
         for host, port in decoder_instances:
             self._add_server_no_lock(ServerRole.DECODE, host, port)
+
+    @staticmethod
+    def _empty_affinity_stats() -> dict[str, int]:
+        return {
+            "hits": 0,
+            "binds": 0,
+            "overflows": 0,
+            "unbinds_lru": 0,
+            "unbinds_taint": 0,
+            "unbinds_miss": 0,
+        }
 
     def _pool(self, role: ServerRole) -> RolePools:
         return self._pools[role]
@@ -618,7 +640,14 @@ class SharedProxyScheduler:
                 "decode_instances": len(self.decoders),
                 "request_num": self.request_num,
                 "prefill_active_token_weight": self.prefill_active_token_weight,
+                "affinity_overload_factor": self.affinity_overload_factor,
+                "affinity_miss_unbind_threshold": self.affinity_miss_unbind_threshold,
                 "prefill_routing_stats": dict(self.prefill_routing_stats),
+                "session_affinity_stats": dict(self.session_affinity_stats),
+                "prefix_affinity_stats": dict(self.prefix_affinity_stats),
+                "prefill_cache_stats_by_source": {
+                    source: dict(stats) for source, stats in self.prefill_cache_stats_by_source.items()
+                },
                 "prefill_loads": {
                     key: {
                         "host": entry.host,
@@ -672,20 +701,85 @@ class SharedProxyScheduler:
             entry.active_kv_cache = max(0.0, entry.active_kv_cache - load)
         self._push_heap(role, key)
 
-    def _resolve_affinity_no_lock(self, mapping: OrderedDict[str, str], affinity_key: str | None) -> str | None:
+    def _affinity_stats_for(self, kind: str) -> dict[str, int]:
+        return self.session_affinity_stats if kind == "session" else self.prefix_affinity_stats
+
+    def _affinity_miss_streak_for(self, kind: str) -> dict[str, int]:
+        return self.session_miss_streak if kind == "session" else self.prefix_miss_streak
+
+    def _affinity_mapping_for(self, kind: str) -> OrderedDict[str, str]:
+        return self.session_lru if kind == "session" else self.prefix_lru
+
+    def _min_live_prefill_priority_no_lock(self) -> float | None:
+        pool = self._pool(ServerRole.PREFILL)
+        live = [
+            self._priority(ServerRole.PREFILL, entry, key)
+            for key, entry in self.prefillers.items()
+            if key not in pool.tainted
+        ]
+        return min(live) if live else None
+
+    def _affinity_overloaded_no_lock(self, prefiller_key: str) -> bool:
+        if self.affinity_overload_factor <= 0:
+            return False
+        pool = self._pool(ServerRole.PREFILL)
+        entry = pool.servers.get(prefiller_key)
+        if entry is None or prefiller_key in pool.tainted:
+            return True
+        bound_priority = self._priority(ServerRole.PREFILL, entry, prefiller_key)
+        min_priority = self._min_live_prefill_priority_no_lock()
+        if min_priority is None:
+            return False
+        return bound_priority > min_priority * self.affinity_overload_factor + AFFINITY_OVERLOAD_MARGIN
+
+    def _resolve_affinity_no_lock(
+        self,
+        mapping: OrderedDict[str, str],
+        affinity_key: str | None,
+        *,
+        kind: str,
+    ) -> str | None:
         if not affinity_key:
             return None
         prefiller_key = mapping.get(affinity_key)
         if prefiller_key is None:
             return None
         pool = self._pool(ServerRole.PREFILL)
+        stats = self._affinity_stats_for(kind)
+        miss_streak = self._affinity_miss_streak_for(kind)
         # A draining node must stop receiving affinity traffic immediately;
         # lazily deleting its entry also makes stale mappings self-healing.
         if prefiller_key not in pool.servers or prefiller_key in pool.tainted:
             mapping.pop(affinity_key, None)
+            miss_streak.pop(affinity_key, None)
+            stats["unbinds_taint"] += 1
             return None
         mapping.move_to_end(affinity_key)
         return prefiller_key
+
+    def _record_heap_shadow_stats_no_lock(self, picked_key: str) -> None:
+        live_prefillers = [
+            (key, entry)
+            for key, entry in self.prefillers.items()
+            if key not in self._pool(ServerRole.PREFILL).tainted
+        ]
+        if not live_prefillers:
+            return
+        baseline_shadow_key = min(
+            live_prefillers,
+            key=lambda item: (0.3 * item[1].active_kv_cache, item[1].ordinal),
+        )[0]
+        active_shadow_key = min(
+            live_prefillers,
+            key=lambda item: (item[1].active_tokens + 0.3 * item[1].active_kv_cache, item[1].ordinal),
+        )[0]
+        self.prefill_routing_stats["heap_decisions"] += 1
+        if baseline_shadow_key != active_shadow_key:
+            self.prefill_routing_stats["shadow_baseline_active_divergences"] += 1
+        if picked_key != baseline_shadow_key:
+            self.prefill_routing_stats["actual_differs_from_baseline"] += 1
+        if picked_key != active_shadow_key:
+            self.prefill_routing_stats["actual_differs_from_active"] += 1
 
     def _reserve_prefiller_no_lock(
         self,
@@ -699,28 +793,24 @@ class SharedProxyScheduler:
         # neither source identifies a live Prefiller.
         # Use case: https://github.com/vllm-project/vllm-ascend/issues/12196
         route_source = "session"
-        prefiller_key = self._resolve_affinity_no_lock(self.session_lru, session_key)
-        if prefiller_key is None:
+        prefiller_key = self._resolve_affinity_no_lock(self.session_lru, session_key, kind="session")
+        if prefiller_key is not None:
+            self.session_affinity_stats["hits"] += 1
+            if self._affinity_overloaded_no_lock(prefiller_key):
+                self.session_affinity_stats["overflows"] += 1
+                route_source = "session-overflow"
+                prefiller_key = None
+        if prefiller_key is None and route_source != "session-overflow":
             route_source = "prefix"
-            prefiller_key = self._resolve_affinity_no_lock(self.prefix_lru, prefix_key)
-        if prefiller_key is None:
+            prefiller_key = self._resolve_affinity_no_lock(self.prefix_lru, prefix_key, kind="prefix")
+            if prefiller_key is not None:
+                self.prefix_affinity_stats["hits"] += 1
+                if self._affinity_overloaded_no_lock(prefiller_key):
+                    self.prefix_affinity_stats["overflows"] += 1
+                    route_source = "prefix-overflow"
+                    prefiller_key = None
+        if prefiller_key is None and route_source not in ("session-overflow", "prefix-overflow"):
             route_source = "heap"
-        baseline_shadow_key = active_shadow_key = None
-        if route_source == "heap":
-            live_prefillers = [
-                (key, entry)
-                for key, entry in self.prefillers.items()
-                if key not in self._pool(ServerRole.PREFILL).tainted
-            ]
-            if live_prefillers:
-                baseline_shadow_key = min(
-                    live_prefillers,
-                    key=lambda item: (0.3 * item[1].active_kv_cache, item[1].ordinal),
-                )[0]
-                active_shadow_key = min(
-                    live_prefillers,
-                    key=lambda item: (item[1].active_tokens + 0.3 * item[1].active_kv_cache, item[1].ordinal),
-                )[0]
         # Reserve both phases through the original scheduler primitive so
         # another request sees the complete cost before making its decision.
         picked = self._pick_server(
@@ -730,14 +820,8 @@ class SharedProxyScheduler:
             kv_cache_load=kv_load,
         )
         picked["route_source"] = route_source
-        if route_source == "heap":
-            self.prefill_routing_stats["heap_decisions"] += 1
-            if baseline_shadow_key is not None and baseline_shadow_key != active_shadow_key:
-                self.prefill_routing_stats["shadow_baseline_active_divergences"] += 1
-            if baseline_shadow_key is not None and picked["key"] != baseline_shadow_key:
-                self.prefill_routing_stats["actual_differs_from_baseline"] += 1
-            if active_shadow_key is not None and picked["key"] != active_shadow_key:
-                self.prefill_routing_stats["actual_differs_from_active"] += 1
+        if route_source in ("heap", "session-overflow", "prefix-overflow"):
+            self._record_heap_shadow_stats_no_lock(picked["key"])
         return picked
 
     def _bind_affinity_no_lock(
@@ -746,6 +830,8 @@ class SharedProxyScheduler:
         affinity_key: str,
         prefiller_key: str,
         capacity: int,
+        *,
+        kind: str,
     ) -> None:
         # Affinity keys are supplied by clients. A bounded LRU prevents their
         # cardinality from turning shared scheduler state into an unbounded map.
@@ -755,10 +841,22 @@ class SharedProxyScheduler:
         # Do not create new ownership claims for a node that is being drained.
         if prefiller_key not in pool.servers or prefiller_key in pool.tainted:
             return
+        stats = self._affinity_stats_for(kind)
+        miss_streak = self._affinity_miss_streak_for(kind)
+        previous = mapping.get(affinity_key)
         mapping[affinity_key] = prefiller_key
         mapping.move_to_end(affinity_key)
+        # Refreshing the same owner must preserve the miss streak so consecutive
+        # zero-cache outcomes can still trip the unbind threshold.
+        if previous != prefiller_key:
+            miss_streak[affinity_key] = 0
+        else:
+            miss_streak.setdefault(affinity_key, 0)
+        stats["binds"] += 1
         while len(mapping) > capacity:
-            mapping.popitem(last=False)
+            evicted_key, _ = mapping.popitem(last=False)
+            miss_streak.pop(evicted_key, None)
+            stats["unbinds_lru"] += 1
 
     def begin_request(
         self,
@@ -804,12 +902,72 @@ class SharedProxyScheduler:
             # A failed Prefill cannot own reusable KV, so mappings are committed
             # here rather than when the node is initially selected.
             if session_key:
-                self._bind_affinity_no_lock(self.session_lru, session_key, key, self.session_lru_size)
+                self._bind_affinity_no_lock(
+                    self.session_lru,
+                    session_key,
+                    key,
+                    self.session_lru_size,
+                    kind="session",
+                )
             # When an existing session wins over a conflicting prefix mapping,
             # keep the prefix owner stable. Rebinding it on every session hit
             # would make the one-node prefix LRU flap between Prefillers.
+            # Overflow and heap paths rebind so the abandoned hot node loses
+            # ownership.
             if prefix_key and route_source != "session":
-                self._bind_affinity_no_lock(self.prefix_lru, prefix_key, key, self.prefix_lru_size)
+                self._bind_affinity_no_lock(
+                    self.prefix_lru,
+                    prefix_key,
+                    key,
+                    self.prefix_lru_size,
+                    kind="prefix",
+                )
+
+    def observe_affinity_outcome(
+        self,
+        route_source: str,
+        affinity_key: str | None,
+        cached_tokens: int | None,
+        prompt_tokens: int | None = None,
+        prefiller_key: str | None = None,
+    ) -> None:
+        """Record cache outcome and optionally unbind a stale affinity mapping."""
+        with self._lock:
+            source_stats = self.prefill_cache_stats_by_source.setdefault(
+                route_source,
+                {"cached_tokens": 0, "prompt_tokens": 0, "requests": 0},
+            )
+            source_stats["requests"] += 1
+            if isinstance(cached_tokens, int):
+                source_stats["cached_tokens"] += max(0, cached_tokens)
+            if isinstance(prompt_tokens, int):
+                source_stats["prompt_tokens"] += max(0, prompt_tokens)
+
+            if route_source not in ("session", "prefix") or not affinity_key:
+                return
+            if self.affinity_miss_unbind_threshold <= 0 or not isinstance(cached_tokens, int):
+                return
+
+            mapping = self._affinity_mapping_for(route_source)
+            miss_streak = self._affinity_miss_streak_for(route_source)
+            stats = self._affinity_stats_for(route_source)
+            if affinity_key not in mapping:
+                return
+            # An outcome observed on a node the mapping no longer points at
+            # (e.g. an overflow rebound the key mid-flight) must not count
+            # against — or unbind — the fresh binding.
+            if prefiller_key is not None and mapping.get(affinity_key) != prefiller_key:
+                return
+            if cached_tokens > 0:
+                miss_streak[affinity_key] = 0
+                return
+            streak = miss_streak.get(affinity_key, 0) + 1
+            miss_streak[affinity_key] = streak
+            if streak < self.affinity_miss_unbind_threshold:
+                return
+            mapping.pop(affinity_key, None)
+            miss_streak.pop(affinity_key, None)
+            stats["unbinds_miss"] += 1
 
     def abort_prefill_reservation(
         self,
@@ -836,6 +994,8 @@ class SharedProxyScheduler:
         with self._lock:
             self.session_lru.clear()
             self.prefix_lru.clear()
+            self.session_miss_streak.clear()
+            self.prefix_miss_streak.clear()
 
     def release_decoder(self, key: str, load: float) -> None:
         with self._lock:
@@ -895,10 +1055,14 @@ class SharedProxyScheduler:
             self.waiting_nodes.pop(key, None)
 
     def _prune_affinity_no_lock(self, prefiller_keys: set[str]) -> None:
-        for mapping in (self.session_lru, self.prefix_lru):
+        for kind, mapping in (("session", self.session_lru), ("prefix", self.prefix_lru)):
+            miss_streak = self._affinity_miss_streak_for(kind)
+            stats = self._affinity_stats_for(kind)
             stale_keys = [affinity_key for affinity_key, key in mapping.items() if key in prefiller_keys]
             for affinity_key in stale_keys:
                 mapping.pop(affinity_key, None)
+                miss_streak.pop(affinity_key, None)
+                stats["unbinds_taint"] += 1
 
     def remove_instances(self, role: ServerRole, instances: list[tuple[str, int]]) -> bool:
         if not instances:
@@ -1162,6 +1326,26 @@ def parse_args() -> argparse.Namespace:
             "Maximum prefix-to-prefiller entries when KV-cache-aware routing is enabled; 0 disables prefix affinity."
         ),
     )
+    parser.add_argument(
+        "--affinity-overload-factor",
+        type=float,
+        default=0.0,
+        help=(
+            "Escape affinity when the bound Prefiller priority exceeds "
+            "min_live_priority * factor + margin. 0 disables the guard; "
+            "enabled values must be >= 1 or the guard would flag the "
+            "least-loaded node as overloaded."
+        ),
+    )
+    parser.add_argument(
+        "--affinity-miss-unbind-threshold",
+        type=int,
+        default=0,
+        help=(
+            "Unbind an affinity key after this many consecutive zero-cached_tokens "
+            "outcomes on affinity hits. 0 disables miss-based unbind."
+        ),
+    )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
@@ -1172,6 +1356,12 @@ def parse_args() -> argparse.Namespace:
     args.prefix_lru_size = max(0, args.prefix_lru_size)
     if not math.isfinite(args.prefill_active_token_weight) or args.prefill_active_token_weight < 0:
         raise ValueError("prefill active-token weight must be finite and non-negative")
+    if not math.isfinite(args.affinity_overload_factor) or args.affinity_overload_factor < 0:
+        raise ValueError("affinity overload factor must be finite and non-negative")
+    if 0 < args.affinity_overload_factor < 1:
+        raise ValueError("affinity overload factor must be 0 (disabled) or >= 1")
+    if args.affinity_miss_unbind_threshold < 0:
+        raise ValueError("affinity miss-unbind threshold must be non-negative")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
@@ -1182,6 +1372,8 @@ def _scheduler_affinity_kwargs(args: argparse.Namespace) -> dict[str, int | floa
         "session_lru_size": args.session_lru_size,
         "prefix_lru_size": args.prefix_lru_size,
         "prefill_active_token_weight": args.prefill_active_token_weight,
+        "affinity_overload_factor": args.affinity_overload_factor,
+        "affinity_miss_unbind_threshold": args.affinity_miss_unbind_threshold,
     }
 
 
@@ -1511,6 +1703,26 @@ async def assign_instances(
     if kv_transfer_params:
         req_data["kv_transfer_params"] = kv_transfer_params
     prefiller_cached_tokens = extract_cached_tokens(response_json)
+    usage = response_json.get("usage") if isinstance(response_json.get("usage"), dict) else {}
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    route_source = prefiller.get("route_source", "heap")
+    if route_source == "session":
+        outcome_affinity_key = session_key
+    elif route_source == "prefix":
+        outcome_affinity_key = prefix_key
+    else:
+        outcome_affinity_key = None
+    try:
+        await runtime.schedule(
+            "observe_affinity_outcome",
+            route_source,
+            outcome_affinity_key,
+            prefiller_cached_tokens,
+            prompt_tokens if isinstance(prompt_tokens, int) else None,
+            prefiller_key,
+        )
+    except Exception:
+        logger.debug("Failed to record affinity outcome for request %s", request_id, exc_info=True)
 
     try:
         decoder = await runtime.schedule("pick_decoder", decoder_score)
@@ -1525,7 +1737,6 @@ async def assign_instances(
 
     prefiller_client = await runtime.get_client(ServerRole.PREFILL, prefiller_key)
     decoder_client = await runtime.get_client(ServerRole.DECODE, decoder["key"])
-    route_source = prefiller.get("route_source", "heap")
     if route_source == "session":
         affinity_key = session_key
     elif route_source == "prefix":

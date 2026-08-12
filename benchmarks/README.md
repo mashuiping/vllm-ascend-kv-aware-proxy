@@ -625,6 +625,12 @@ GROUP_ORDER='candidate-off candidate-on baseline' \
 For normal profiles, B versus C isolates affinity. For `load-balance`,
 automatic `active-token` mode makes A exact upstream, B candidate weight=0 and
 C candidate weight=1; B versus C then isolates the active-token lifecycle.
+Setting `ABC_COMPARISON_MODE=affinity-guard` makes all three groups run the
+candidate source with KV-aware routing on: A and B keep the guards disabled
+(A versus B is the same-policy noise control) while C enables
+the guards (override the defaults 1.5 / 3 by exporting
+`AFFINITY_OVERLOAD_FACTOR` and `AFFINITY_MISS_UNBIND_THRESHOLD`); A versus C
+then isolates the guard mechanisms.
 Set a different integer `WORKLOAD_SEED` on every repetition; it overrides only
 the generated workload and is recorded in `metadata.json` and the workload
 manifest. Start with the first three cyclic Latin-square rows below so every
@@ -657,6 +663,31 @@ python benchmarks/compare_repetitions.py \
 
 The aggregate output reports whether all six group orders were covered and
 whether every repetition used a distinct workload seed.
+
+## Re-running the legacy affinity experiments
+
+The 2026-08-06/07 affinity runs predate the proxy-identity verification, the
+same-policy noise control and the affinity instrumentation, so they cannot
+support performance claims. `run_affinity_repetitions.sh` re-runs
+`session-affinity.json` and `shared-prefix-capacity.json` on the hardened
+harness — six repetitions per profile with the full Latin-square order rotation
+and distinct seeds — then aggregates and applies the noise-gate verdict:
+
+```bash
+MODEL=qwen3-32b PREFILL_NODE=<node> \
+  bash benchmarks/run_affinity_repetitions.sh
+# or pick profiles / fewer repetitions explicitly:
+REPETITIONS=3 bash benchmarks/run_affinity_repetitions.sh \
+  benchmarks/profiles/shared-prefix-capacity.json
+```
+
+Judgment standard (same as the active-token analysis): the per-run |A vs B|
+relative delta defines the noise band for each metric because B is
+decision-identical to A; an effect is claimed only when the mean |A vs C|
+delta exceeds that band with a consistent direction across repetitions, and
+the paired bootstrap CI from `compare_repetitions.py` excludes zero.
+`judge_affinity_repetitions.py` prints this verdict per metric and can also be
+run standalone on any set of completed experiment directories.
 
 For compatibility, the previous local/port-forward execution path remains
 available:

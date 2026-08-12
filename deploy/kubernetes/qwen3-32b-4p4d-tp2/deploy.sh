@@ -12,6 +12,8 @@ SESSION_LRU_SIZE="${SESSION_LRU_SIZE:-4096}"
 PREFIX_HASH_CHARS="${PREFIX_HASH_CHARS:-1024}"
 PREFIX_LRU_SIZE="${PREFIX_LRU_SIZE:-1024}"
 PREFILL_ACTIVE_TOKEN_WEIGHT="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
+AFFINITY_OVERLOAD_FACTOR="${AFFINITY_OVERLOAD_FACTOR:-0}"
+AFFINITY_MISS_UNBIND_THRESHOLD="${AFFINITY_MISS_UNBIND_THRESHOLD:-0}"
 
 case "${PROXY_VARIANT}" in
   candidate)
@@ -142,6 +144,8 @@ render() {
     -e "s|__PREFIX_HASH_CHARS__|$(escape_sed_replacement "${PREFIX_HASH_CHARS}")|g" \
     -e "s|__PREFIX_LRU_SIZE__|$(escape_sed_replacement "${PREFIX_LRU_SIZE}")|g" \
     -e "s|__PREFILL_ACTIVE_TOKEN_WEIGHT__|$(escape_sed_replacement "${PREFILL_ACTIVE_TOKEN_WEIGHT}")|g" \
+    -e "s|__AFFINITY_OVERLOAD_FACTOR__|$(escape_sed_replacement "${AFFINITY_OVERLOAD_FACTOR}")|g" \
+    -e "s|__AFFINITY_MISS_UNBIND_THRESHOLD__|$(escape_sed_replacement "${AFFINITY_MISS_UNBIND_THRESHOLD}")|g" \
     -e "s|__RESTART_TOKEN__|$(escape_sed_replacement "${RESTART_TOKEN}")|g" \
     "${file}"
 }
