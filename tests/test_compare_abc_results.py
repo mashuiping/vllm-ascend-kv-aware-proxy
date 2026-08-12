@@ -39,11 +39,13 @@ def add_identity(root: Path, group: str, source_hash: str, *, mode: str = "affin
         kv_aware = "true"
         overload_factor = "1.5" if group == "candidate-on" else "0"
         miss_unbind_threshold = "3" if group == "candidate-on" else "0"
+        cache_discount_alpha = "0.3" if group == "candidate-on" else "0"
     else:
         variant = "baseline" if group == "baseline" else "candidate"
         kv_aware = "true" if mode == "affinity" and group == "candidate-on" else "false"
         overload_factor = "0"
         miss_unbind_threshold = "0"
+        cache_discount_alpha = "0"
     active_weight = "0" if mode == "active-token" and group == "candidate-off" else "1.0"
     config["proxy_identity"] = {
         "group": group,
@@ -58,6 +60,8 @@ def add_identity(root: Path, group: str, source_hash: str, *, mode: str = "affin
         "actual_affinity_overload_factor": overload_factor,
         "expected_affinity_miss_unbind_threshold": miss_unbind_threshold,
         "actual_affinity_miss_unbind_threshold": miss_unbind_threshold,
+        "expected_affinity_cache_discount_alpha": cache_discount_alpha,
+        "actual_affinity_cache_discount_alpha": cache_discount_alpha,
         "expected_source_sha256": source_hash,
         "actual_source_sha256": source_hash,
     }
@@ -156,6 +160,7 @@ def test_build_comparison_rejects_affinity_guard_without_guards_on_c(tmp_path: P
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["proxy_identity"]["actual_affinity_overload_factor"] = "0"
     config["proxy_identity"]["actual_affinity_miss_unbind_threshold"] = "0"
+    config["proxy_identity"]["actual_affinity_cache_discount_alpha"] = "0"
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
     comparison = build_comparison(tmp_path)

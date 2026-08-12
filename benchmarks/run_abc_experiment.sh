@@ -96,8 +96,11 @@ esac
 
 # Guard settings apply to candidate-on only in affinity-guard mode. Defaults
 # enable both mechanisms so the C group exercises escape and miss-unbind.
+# Cache-discount alpha defaults off so existing guard runs stay comparable;
+# opt in explicitly when the experiment targets reservation discounting.
 guard_overload_factor="${AFFINITY_OVERLOAD_FACTOR:-1.5}"
 guard_miss_unbind_threshold="${AFFINITY_MISS_UNBIND_THRESHOLD:-3}"
+guard_cache_discount_alpha="${AFFINITY_CACHE_DISCOUNT_ALPHA:-0}"
 decoder_count="${BENCHMARK_DECODER_COUNT:-${profile_decoder_count}}"
 sample_interval="${SAMPLE_INTERVAL:-${profile_sample_interval}}"
 case "${decoder_count}" in
@@ -179,6 +182,7 @@ deploy_proxy_group() {
   local active_token_weight="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
   local overload_factor=0
   local miss_unbind_threshold=0
+  local cache_discount_alpha=0
   case "${group}" in
     baseline)
       if [[ "${comparison_mode}" == "affinity-guard" ]]; then
@@ -216,6 +220,7 @@ deploy_proxy_group() {
       if [[ "${comparison_mode}" == "affinity-guard" ]]; then
         overload_factor="${guard_overload_factor}"
         miss_unbind_threshold="${guard_miss_unbind_threshold}"
+        cache_discount_alpha="${guard_cache_discount_alpha}"
       fi
       ;;
     *)
@@ -223,11 +228,12 @@ deploy_proxy_group() {
       return 2
       ;;
   esac
-  log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware} decoder_count=${decoder_count} overload_factor=${overload_factor} miss_unbind_threshold=${miss_unbind_threshold}"
+  log "${group}: deploying proxy variant=${proxy_variant} kv_aware=${kv_aware} decoder_count=${decoder_count} overload_factor=${overload_factor} miss_unbind_threshold=${miss_unbind_threshold} cache_discount_alpha=${cache_discount_alpha}"
   PROXY_VARIANT="${proxy_variant}" KV_AWARE_ROUTING="${kv_aware}" PROXY_DECODER_COUNT="${decoder_count}" \
     PREFILL_ACTIVE_TOKEN_WEIGHT="${active_token_weight}" \
     AFFINITY_OVERLOAD_FACTOR="${overload_factor}" \
     AFFINITY_MISS_UNBIND_THRESHOLD="${miss_unbind_threshold}" \
+    AFFINITY_CACHE_DISCOUNT_ALPHA="${cache_discount_alpha}" \
     PROXY_SOURCE_PATH="${proxy_source}" \
     bash "${DEPLOY_DIR}/deploy.sh" proxy
 }
@@ -264,7 +270,7 @@ build_metadata_json() {
 verify_proxy_group() {
   local group="$1"
   local expected_variant expected_kv_aware expected_source expected_active_token_weight
-  local expected_overload_factor=0 expected_miss_unbind_threshold=0
+  local expected_overload_factor=0 expected_miss_unbind_threshold=0 expected_cache_discount_alpha=0
   expected_active_token_weight="${PREFILL_ACTIVE_TOKEN_WEIGHT:-1.0}"
   case "${group}" in
     baseline)
@@ -301,34 +307,36 @@ verify_proxy_group() {
       if [[ "${comparison_mode}" == "affinity-guard" ]]; then
         expected_overload_factor="${guard_overload_factor}"
         expected_miss_unbind_threshold="${guard_miss_unbind_threshold}"
+        expected_cache_discount_alpha="${guard_cache_discount_alpha}"
       fi
       ;;
   esac
 
   local pod_name expected_sha actual_sha actual_variant actual_kv_aware actual_active_token_weight pod_uid image_id
-  local actual_overload_factor actual_miss_unbind_threshold
+  local actual_overload_factor actual_miss_unbind_threshold actual_cache_discount_alpha
   pod_name="$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=pd-proxy \
     --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}')"
   [[ -n "${pod_name}" ]] || { echo "${group}: no proxy pod found" >&2; return 1; }
   expected_sha="$(sha256_file "${expected_source}")"
   actual_sha="$(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
     'import hashlib, pathlib; print(hashlib.sha256(pathlib.Path("/opt/pd-proxy/load_balance_proxy_server_example.py").read_bytes()).hexdigest())')"
-  read -r actual_variant actual_kv_aware actual_active_token_weight actual_overload_factor actual_miss_unbind_threshold < <(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
-    'import os; print(os.environ.get("PROXY_VARIANT", ""), os.environ.get("KV_AWARE_ROUTING", ""), os.environ.get("PREFILL_ACTIVE_TOKEN_WEIGHT", ""), os.environ.get("AFFINITY_OVERLOAD_FACTOR", "0"), os.environ.get("AFFINITY_MISS_UNBIND_THRESHOLD", "0"))')
+  read -r actual_variant actual_kv_aware actual_active_token_weight actual_overload_factor actual_miss_unbind_threshold actual_cache_discount_alpha < <(kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
+    'import os; print(os.environ.get("PROXY_VARIANT", ""), os.environ.get("KV_AWARE_ROUTING", ""), os.environ.get("PREFILL_ACTIVE_TOKEN_WEIGHT", ""), os.environ.get("AFFINITY_OVERLOAD_FACTOR", "0"), os.environ.get("AFFINITY_MISS_UNBIND_THRESHOLD", "0"), os.environ.get("AFFINITY_CACHE_DISCOUNT_ALPHA", "0"))')
   pod_uid="$(kubectl -n "${NAMESPACE}" get pod "${pod_name}" -o jsonpath='{.metadata.uid}')"
   image_id="$(kubectl -n "${NAMESPACE}" get pod "${pod_name}" -o jsonpath='{.status.containerStatuses[?(@.name=="proxy")].imageID}')"
 
-  if [[ "${actual_sha}" != "${expected_sha}" || "${actual_variant}" != "${expected_variant}" || "${actual_kv_aware}" != "${expected_kv_aware}" || "${actual_active_token_weight}" != "${expected_active_token_weight}" || "${actual_overload_factor}" != "${expected_overload_factor}" || "${actual_miss_unbind_threshold}" != "${expected_miss_unbind_threshold}" ]]; then
-    echo "${group}: proxy identity mismatch expected=${expected_variant}/${expected_kv_aware}/weight-${expected_active_token_weight}/guard-${expected_overload_factor}-${expected_miss_unbind_threshold}/${expected_sha} actual=${actual_variant}/${actual_kv_aware}/weight-${actual_active_token_weight}/guard-${actual_overload_factor}-${actual_miss_unbind_threshold}/${actual_sha}" >&2
+  if [[ "${actual_sha}" != "${expected_sha}" || "${actual_variant}" != "${expected_variant}" || "${actual_kv_aware}" != "${expected_kv_aware}" || "${actual_active_token_weight}" != "${expected_active_token_weight}" || "${actual_overload_factor}" != "${expected_overload_factor}" || "${actual_miss_unbind_threshold}" != "${expected_miss_unbind_threshold}" || "${actual_cache_discount_alpha}" != "${expected_cache_discount_alpha}" ]]; then
+    echo "${group}: proxy identity mismatch expected=${expected_variant}/${expected_kv_aware}/weight-${expected_active_token_weight}/guard-${expected_overload_factor}-${expected_miss_unbind_threshold}-${expected_cache_discount_alpha}/${expected_sha} actual=${actual_variant}/${actual_kv_aware}/weight-${actual_active_token_weight}/guard-${actual_overload_factor}-${actual_miss_unbind_threshold}-${actual_cache_discount_alpha}/${actual_sha}" >&2
     return 1
   fi
 
   "${PYTHON_BIN}" -c \
-    'import json,sys; print(json.dumps(dict(zip(("group","comparison_mode","expected_variant","actual_variant","expected_kv_aware","actual_kv_aware","expected_active_token_weight","actual_active_token_weight","expected_affinity_overload_factor","actual_affinity_overload_factor","expected_affinity_miss_unbind_threshold","actual_affinity_miss_unbind_threshold","expected_source_sha256","actual_source_sha256","pod_name","pod_uid","image_id"), sys.argv[1:])), separators=(",", ":")))' \
+    'import json,sys; print(json.dumps(dict(zip(("group","comparison_mode","expected_variant","actual_variant","expected_kv_aware","actual_kv_aware","expected_active_token_weight","actual_active_token_weight","expected_affinity_overload_factor","actual_affinity_overload_factor","expected_affinity_miss_unbind_threshold","actual_affinity_miss_unbind_threshold","expected_affinity_cache_discount_alpha","actual_affinity_cache_discount_alpha","expected_source_sha256","actual_source_sha256","pod_name","pod_uid","image_id"), sys.argv[1:])), separators=(",", ":")))' \
     "${group}" "${comparison_mode}" "${expected_variant}" "${actual_variant}" "${expected_kv_aware}" "${actual_kv_aware}" \
     "${expected_active_token_weight}" "${actual_active_token_weight}" \
     "${expected_overload_factor}" "${actual_overload_factor}" \
     "${expected_miss_unbind_threshold}" "${actual_miss_unbind_threshold}" \
+    "${expected_cache_discount_alpha}" "${actual_cache_discount_alpha}" \
     "${expected_sha}" "${actual_sha}" "${pod_name}" "${pod_uid}" "${image_id}"
 }
 

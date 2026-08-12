@@ -194,6 +194,10 @@ SESSION_HEADER_NAMES: tuple[str, ...] = (
 PREFIX_HASH_VERSION = "pd-prefix-v1"
 # Absolute slack so near-zero priorities do not false-trigger overload escape.
 AFFINITY_OVERLOAD_MARGIN = 1.0
+# A cache-discounted reservation never drops below this fraction of the full
+# score: even a 100%-cached prompt still costs scheduling, attention over the
+# cached prefix and KV-transfer setup.
+AFFINITY_DISCOUNT_MIN_FRACTION = 0.1
 
 
 def extract_cached_tokens(response_json: dict) -> int | None:
@@ -502,6 +506,7 @@ class SharedProxyScheduler:
         prefill_active_token_weight: float = 1.0,
         affinity_overload_factor: float = 0.0,
         affinity_miss_unbind_threshold: int = 0,
+        affinity_cache_discount_alpha: float = 0.0,
     ):
         self._lock = threading.RLock()
         self.request_num = 0
@@ -516,10 +521,15 @@ class SharedProxyScheduler:
         self.prefill_active_token_weight = max(0.0, float(prefill_active_token_weight))
         self.affinity_overload_factor = max(0.0, float(affinity_overload_factor))
         self.affinity_miss_unbind_threshold = max(0, int(affinity_miss_unbind_threshold))
+        self.affinity_cache_discount_alpha = min(1.0, max(0.0, float(affinity_cache_discount_alpha)))
         self.session_lru: OrderedDict[str, str] = OrderedDict()
         self.prefix_lru: OrderedDict[str, str] = OrderedDict()
         self.session_miss_streak: dict[str, int] = {}
         self.prefix_miss_streak: dict[str, int] = {}
+        # Per-binding EMA of cached_tokens/prompt_tokens observed on affinity
+        # hits; used to discount reservations toward true compute cost.
+        self.session_cache_ema: dict[str, float] = {}
+        self.prefix_cache_ema: dict[str, float] = {}
         self.prefill_routing_stats = {
             "heap_decisions": 0,
             "shadow_baseline_active_divergences": 0,
@@ -642,6 +652,7 @@ class SharedProxyScheduler:
                 "prefill_active_token_weight": self.prefill_active_token_weight,
                 "affinity_overload_factor": self.affinity_overload_factor,
                 "affinity_miss_unbind_threshold": self.affinity_miss_unbind_threshold,
+                "affinity_cache_discount_alpha": self.affinity_cache_discount_alpha,
                 "prefill_routing_stats": dict(self.prefill_routing_stats),
                 "session_affinity_stats": dict(self.session_affinity_stats),
                 "prefix_affinity_stats": dict(self.prefix_affinity_stats),
@@ -710,6 +721,24 @@ class SharedProxyScheduler:
     def _affinity_mapping_for(self, kind: str) -> OrderedDict[str, str]:
         return self.session_lru if kind == "session" else self.prefix_lru
 
+    def _affinity_cache_ema_for(self, kind: str) -> dict[str, float]:
+        return self.session_cache_ema if kind == "session" else self.prefix_cache_ema
+
+    def _affinity_reserve_fraction_no_lock(self, kind: str, affinity_key: str | None) -> float:
+        """Fraction of the full score an affinity-hit reservation should cost.
+
+        A bound node's cached prefix means the real prefill compute is roughly
+        (1 - hit_ratio) of the full prompt. Reserving the full score makes the
+        node look busier than it is, which biases the overload guard against
+        exactly the nodes affinity is helping.
+        """
+        if self.affinity_cache_discount_alpha <= 0 or not affinity_key:
+            return 1.0
+        ema = self._affinity_cache_ema_for(kind).get(affinity_key)
+        if ema is None:
+            return 1.0
+        return max(AFFINITY_DISCOUNT_MIN_FRACTION, 1.0 - ema)
+
     def _min_live_prefill_priority_no_lock(self) -> float | None:
         pool = self._pool(ServerRole.PREFILL)
         live = [
@@ -752,6 +781,7 @@ class SharedProxyScheduler:
         if prefiller_key not in pool.servers or prefiller_key in pool.tainted:
             mapping.pop(affinity_key, None)
             miss_streak.pop(affinity_key, None)
+            self._affinity_cache_ema_for(kind).pop(affinity_key, None)
             stats["unbinds_taint"] += 1
             return None
         mapping.move_to_end(affinity_key)
@@ -811,15 +841,31 @@ class SharedProxyScheduler:
                     prefiller_key = None
         if prefiller_key is None and route_source not in ("session-overflow", "prefix-overflow"):
             route_source = "heap"
+        # Affinity hits reserve a cache-discounted compute cost so accounting
+        # tracks real prefill work. KV is deliberately NOT discounted: a prefix
+        # cache hit skips computation, but the decoder still needs the full
+        # prompt KV, so transfer/residency pressure is unchanged. The caller
+        # must release exactly what was reserved, so the effective loads are
+        # returned alongside the pick.
+        if route_source == "session":
+            fraction = self._affinity_reserve_fraction_no_lock("session", session_key)
+        elif route_source == "prefix":
+            fraction = self._affinity_reserve_fraction_no_lock("prefix", prefix_key)
+        else:
+            fraction = 1.0
+        effective_compute_load = compute_load * fraction
+        effective_kv_load = kv_load
         # Reserve both phases through the original scheduler primitive so
         # another request sees the complete cost before making its decision.
         picked = self._pick_server(
             ServerRole.PREFILL,
             key=prefiller_key,
-            active_tokens_load=compute_load,
-            kv_cache_load=kv_load,
+            active_tokens_load=effective_compute_load,
+            kv_cache_load=effective_kv_load,
         )
         picked["route_source"] = route_source
+        picked["compute_load"] = effective_compute_load
+        picked["kv_load"] = effective_kv_load
         if route_source in ("heap", "session-overflow", "prefix-overflow"):
             self._record_heap_shadow_stats_no_lock(picked["key"])
         return picked
@@ -843,19 +889,23 @@ class SharedProxyScheduler:
             return
         stats = self._affinity_stats_for(kind)
         miss_streak = self._affinity_miss_streak_for(kind)
+        cache_ema = self._affinity_cache_ema_for(kind)
         previous = mapping.get(affinity_key)
         mapping[affinity_key] = prefiller_key
         mapping.move_to_end(affinity_key)
         # Refreshing the same owner must preserve the miss streak so consecutive
-        # zero-cache outcomes can still trip the unbind threshold.
+        # zero-cache outcomes can still trip the unbind threshold. A different
+        # owner starts cold: its hit-ratio history belongs to the old node.
         if previous != prefiller_key:
             miss_streak[affinity_key] = 0
+            cache_ema.pop(affinity_key, None)
         else:
             miss_streak.setdefault(affinity_key, 0)
         stats["binds"] += 1
         while len(mapping) > capacity:
             evicted_key, _ = mapping.popitem(last=False)
             miss_streak.pop(evicted_key, None)
+            cache_ema.pop(evicted_key, None)
             stats["unbinds_lru"] += 1
 
     def begin_request(
@@ -945,12 +995,7 @@ class SharedProxyScheduler:
 
             if route_source not in ("session", "prefix") or not affinity_key:
                 return
-            if self.affinity_miss_unbind_threshold <= 0 or not isinstance(cached_tokens, int):
-                return
-
             mapping = self._affinity_mapping_for(route_source)
-            miss_streak = self._affinity_miss_streak_for(route_source)
-            stats = self._affinity_stats_for(route_source)
             if affinity_key not in mapping:
                 return
             # An outcome observed on a node the mapping no longer points at
@@ -958,6 +1003,26 @@ class SharedProxyScheduler:
             # against — or unbind — the fresh binding.
             if prefiller_key is not None and mapping.get(affinity_key) != prefiller_key:
                 return
+
+            if (
+                self.affinity_cache_discount_alpha > 0
+                and isinstance(cached_tokens, int)
+                and isinstance(prompt_tokens, int)
+                and prompt_tokens > 0
+            ):
+                cache_ema = self._affinity_cache_ema_for(route_source)
+                ratio = min(1.0, max(0.0, cached_tokens / prompt_tokens))
+                previous_ema = cache_ema.get(affinity_key)
+                if previous_ema is None:
+                    cache_ema[affinity_key] = ratio
+                else:
+                    alpha = self.affinity_cache_discount_alpha
+                    cache_ema[affinity_key] = alpha * ratio + (1.0 - alpha) * previous_ema
+
+            if self.affinity_miss_unbind_threshold <= 0 or not isinstance(cached_tokens, int):
+                return
+            miss_streak = self._affinity_miss_streak_for(route_source)
+            stats = self._affinity_stats_for(route_source)
             if cached_tokens > 0:
                 miss_streak[affinity_key] = 0
                 return
@@ -967,6 +1032,7 @@ class SharedProxyScheduler:
                 return
             mapping.pop(affinity_key, None)
             miss_streak.pop(affinity_key, None)
+            self._affinity_cache_ema_for(route_source).pop(affinity_key, None)
             stats["unbinds_miss"] += 1
 
     def abort_prefill_reservation(
@@ -996,6 +1062,8 @@ class SharedProxyScheduler:
             self.prefix_lru.clear()
             self.session_miss_streak.clear()
             self.prefix_miss_streak.clear()
+            self.session_cache_ema.clear()
+            self.prefix_cache_ema.clear()
 
     def release_decoder(self, key: str, load: float) -> None:
         with self._lock:
@@ -1057,11 +1125,13 @@ class SharedProxyScheduler:
     def _prune_affinity_no_lock(self, prefiller_keys: set[str]) -> None:
         for kind, mapping in (("session", self.session_lru), ("prefix", self.prefix_lru)):
             miss_streak = self._affinity_miss_streak_for(kind)
+            cache_ema = self._affinity_cache_ema_for(kind)
             stats = self._affinity_stats_for(kind)
             stale_keys = [affinity_key for affinity_key, key in mapping.items() if key in prefiller_keys]
             for affinity_key in stale_keys:
                 mapping.pop(affinity_key, None)
                 miss_streak.pop(affinity_key, None)
+                cache_ema.pop(affinity_key, None)
                 stats["unbinds_taint"] += 1
 
     def remove_instances(self, role: ServerRole, instances: list[tuple[str, int]]) -> bool:
@@ -1346,6 +1416,17 @@ def parse_args() -> argparse.Namespace:
             "outcomes on affinity hits. 0 disables miss-based unbind."
         ),
     )
+    parser.add_argument(
+        "--affinity-cache-discount-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "EMA smoothing factor for per-binding cache hit ratio. When > 0, "
+            "affinity-hit reservations are discounted by the observed hit ratio "
+            "so load accounting tracks real prefill compute instead of raw "
+            "prompt size. 0 disables discounting."
+        ),
+    )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
@@ -1360,6 +1441,11 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("affinity overload factor must be finite and non-negative")
     if 0 < args.affinity_overload_factor < 1:
         raise ValueError("affinity overload factor must be 0 (disabled) or >= 1")
+    if (
+        not math.isfinite(args.affinity_cache_discount_alpha)
+        or not 0.0 <= args.affinity_cache_discount_alpha <= 1.0
+    ):
+        raise ValueError("affinity cache discount alpha must be within [0, 1]")
     if args.affinity_miss_unbind_threshold < 0:
         raise ValueError("affinity miss-unbind threshold must be non-negative")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
@@ -1374,6 +1460,7 @@ def _scheduler_affinity_kwargs(args: argparse.Namespace) -> dict[str, int | floa
         "prefill_active_token_weight": args.prefill_active_token_weight,
         "affinity_overload_factor": args.affinity_overload_factor,
         "affinity_miss_unbind_threshold": args.affinity_miss_unbind_threshold,
+        "affinity_cache_discount_alpha": args.affinity_cache_discount_alpha,
     }
 
 
@@ -1637,6 +1724,11 @@ async def assign_instances(
         prefix_key,
     )
     prefiller_key = prefiller["key"]
+    # Cache-discounted reservations must be released at exactly the reserved
+    # amount, so all downstream complete/abort/release calls use the effective
+    # loads the scheduler actually booked.
+    prefiller_compute_score = float(prefiller.get("compute_load", prefiller_compute_score))
+    prefiller_kv_score = float(prefiller.get("kv_load", prefiller_kv_score))
 
     try:
         response = await send_request_to_service(

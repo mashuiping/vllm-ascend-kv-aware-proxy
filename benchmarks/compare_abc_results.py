@@ -97,17 +97,24 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
             except (TypeError, ValueError):
                 off_weight = on_weight = -1.0
 
-            def guard_values(group: str) -> tuple[float, float]:
+            def guard_values(group: str) -> tuple[float, float, float]:
                 identity = identities[group]
-                try:
-                    factor = float(identity.get("actual_affinity_overload_factor"))
-                except (TypeError, ValueError):
-                    factor = -1.0
-                try:
-                    threshold = float(identity.get("actual_affinity_miss_unbind_threshold"))
-                except (TypeError, ValueError):
-                    threshold = -1.0
-                return factor, threshold
+
+                def field(name: str) -> float:
+                    try:
+                        return float(identity.get(name))
+                    except (TypeError, ValueError):
+                        return -1.0
+
+                return (
+                    field("actual_affinity_overload_factor"),
+                    field("actual_affinity_miss_unbind_threshold"),
+                    # Absent in identities recorded before the cache-discount
+                    # mechanism existed; those proxies ran with it disabled.
+                    field("actual_affinity_cache_discount_alpha")
+                    if "actual_affinity_cache_discount_alpha" in identity
+                    else 0.0,
+                )
 
             if comparison_mode == "active-token":
                 identity_checks["comparison_mode_semantics_match"] = (
@@ -133,9 +140,9 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
                     all(identities[group].get("actual_variant") == "candidate" for group in GROUPS)
                     and all(identities[group].get("actual_kv_aware") == "true" for group in GROUPS)
                     and off_weight == on_weight
-                    and baseline_guards == (0.0, 0.0)
-                    and off_guards == (0.0, 0.0)
-                    and (on_guards[0] > 0.0 or on_guards[1] > 0.0)
+                    and baseline_guards == (0.0, 0.0, 0.0)
+                    and off_guards == (0.0, 0.0, 0.0)
+                    and any(value > 0.0 for value in on_guards)
                 )
             else:
                 identity_checks["comparison_mode_semantics_match"] = False

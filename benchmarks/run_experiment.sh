@@ -23,8 +23,10 @@ log() {
 
 guard_overload_factor="${AFFINITY_OVERLOAD_FACTOR:-1.5}"
 guard_miss_unbind_threshold="${AFFINITY_MISS_UNBIND_THRESHOLD:-3}"
+guard_cache_discount_alpha="${AFFINITY_CACHE_DISCOUNT_ALPHA:-0}"
 export AFFINITY_OVERLOAD_FACTOR=0
 export AFFINITY_MISS_UNBIND_THRESHOLD=0
+export AFFINITY_CACHE_DISCOUNT_ALPHA=0
 
 case "${GROUP}" in
   baseline)
@@ -61,6 +63,7 @@ case "${GROUP}" in
     if [[ "${comparison_mode}" == "affinity-guard" ]]; then
       export AFFINITY_OVERLOAD_FACTOR="${guard_overload_factor}"
       export AFFINITY_MISS_UNBIND_THRESHOLD="${guard_miss_unbind_threshold}"
+      export AFFINITY_CACHE_DISCOUNT_ALPHA="${guard_cache_discount_alpha}"
     fi
     ;;
   *)

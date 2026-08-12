@@ -902,6 +902,118 @@ def test_prune_affinity_clears_miss_streaks_and_counts_taint_unbinds():
     assert scheduler.prefix_affinity_stats["unbinds_taint"] == 1
 
 
+def test_cache_discount_tracks_ema_and_discounts_affinity_reservations():
+    scheduler = make_scheduler(affinity_cache_discount_alpha=0.5)
+    first = scheduler.begin_request(100.0, 100.0, "session")
+    assert first["compute_load"] == 100.0  # heap route: no history, full cost
+    scheduler.complete_prefill(first["key"], first["compute_load"], "session", None, route_source="heap")
+    bound = first["key"]
+
+    # First observation seeds the EMA directly: 80/100 cached.
+    hit = scheduler.begin_request(100.0, 100.0, "session")
+    assert hit["key"] == bound
+    assert hit["compute_load"] == 100.0  # EMA not yet observed at reserve time
+    scheduler.complete_prefill(hit["key"], hit["compute_load"], "session", None, route_source="session")
+    scheduler.observe_affinity_outcome("session", "session", 80, 100, prefiller_key=bound)
+    assert scheduler.session_cache_ema["session"] == pytest.approx(0.8)
+
+    # Next session hit reserves compute at (1 - 0.8) of the full score; KV is
+    # never discounted because the decoder still needs the full prompt KV.
+    discounted = scheduler.begin_request(100.0, 100.0, "session")
+    assert discounted["key"] == bound
+    assert discounted["compute_load"] == pytest.approx(20.0)
+    assert discounted["kv_load"] == pytest.approx(100.0)
+    assert scheduler.prefillers[bound].active_tokens == pytest.approx(20.0)
+
+    # Releasing the returned effective load balances the books exactly.
+    scheduler.complete_prefill(bound, discounted["compute_load"], "session", None, route_source="session")
+    assert scheduler.prefillers[bound].active_tokens == pytest.approx(0.0)
+
+    # EMA blends subsequent observations: 0.5 * 0.4 + 0.5 * 0.8 = 0.6.
+    scheduler.observe_affinity_outcome("session", "session", 40, 100, prefiller_key=bound)
+    assert scheduler.session_cache_ema["session"] == pytest.approx(0.6)
+
+
+def test_cache_discount_floor_and_disabled_alpha():
+    scheduler = make_scheduler(affinity_cache_discount_alpha=1.0)
+    keys = list(scheduler.prefillers)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 4, kind="session")
+    scheduler.observe_affinity_outcome("session", "session", 100, 100, prefiller_key=keys[0])
+    assert scheduler.session_cache_ema["session"] == pytest.approx(1.0)
+    # A fully cached prompt still reserves the minimum fraction, never zero.
+    hit = scheduler.begin_request(100.0, 100.0, "session")
+    assert hit["compute_load"] == pytest.approx(100.0 * proxy.AFFINITY_DISCOUNT_MIN_FRACTION)
+
+    disabled = make_scheduler(affinity_cache_discount_alpha=0.0)
+    disabled._bind_affinity_no_lock(disabled.session_lru, "session", keys[0], 4, kind="session")
+    disabled.observe_affinity_outcome("session", "session", 100, 100, prefiller_key=keys[0])
+    assert disabled.session_cache_ema == {}
+    hit = disabled.begin_request(100.0, 100.0, "session")
+    assert hit["compute_load"] == 100.0
+
+
+def test_cache_discount_applies_to_prefix_affinity_hits():
+    scheduler = make_scheduler(affinity_cache_discount_alpha=0.5)
+    keys = list(scheduler.prefillers)
+    scheduler._bind_affinity_no_lock(scheduler.prefix_lru, "prefix", keys[0], 4, kind="prefix")
+    scheduler.observe_affinity_outcome("prefix", "prefix", 60, 100, prefiller_key=keys[0])
+    assert scheduler.prefix_cache_ema["prefix"] == pytest.approx(0.6)
+
+    hit = scheduler.begin_request(100.0, 100.0, None, "prefix")
+    assert hit["route_source"] == "prefix"
+    assert hit["key"] == keys[0]
+    assert hit["compute_load"] == pytest.approx(40.0)
+    assert hit["kv_load"] == pytest.approx(100.0)
+
+
+def test_overflow_route_reserves_full_cost_despite_cache_ema():
+    scheduler = make_scheduler(affinity_overload_factor=1.5, affinity_cache_discount_alpha=0.5)
+    keys = list(scheduler.prefillers)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 4, kind="session")
+    scheduler.observe_affinity_outcome("session", "session", 90, 100, prefiller_key=keys[0])
+    # Overload the bound node so the guard escapes to the idle peer.
+    scheduler.prefillers[keys[0]].active_kv_cache = 10_000.0
+    scheduler.prefillers[keys[1]].active_kv_cache = 0.0
+    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
+
+    escaped = scheduler.begin_request(100.0, 100.0, "session")
+    assert escaped["route_source"] == "session-overflow"
+    assert escaped["key"] == keys[1]
+    # The escape target has no cache for this session; full cost applies.
+    assert escaped["compute_load"] == pytest.approx(100.0)
+    assert escaped["kv_load"] == pytest.approx(100.0)
+
+
+def test_cache_discount_ema_resets_when_binding_moves_to_another_node():
+    scheduler = make_scheduler(affinity_cache_discount_alpha=0.5)
+    keys = list(scheduler.prefillers)
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 4, kind="session")
+    scheduler.observe_affinity_outcome("session", "session", 90, 100, prefiller_key=keys[0])
+    assert "session" in scheduler.session_cache_ema
+
+    # The hit-ratio history belongs to keys[0]; a rebind to keys[1] starts cold.
+    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[1], 4, kind="session")
+    assert "session" not in scheduler.session_cache_ema
+
+
+def test_parse_args_rejects_cache_discount_alpha_outside_unit_interval(monkeypatch):
+    for bad_value in ("-0.1", "1.5"):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["load_balance_proxy_server_example.py", "--affinity-cache-discount-alpha", bad_value],
+        )
+        with pytest.raises(ValueError, match="within \\[0, 1\\]"):
+            proxy.parse_args()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["load_balance_proxy_server_example.py", "--affinity-cache-discount-alpha", "0.3"],
+    )
+    assert proxy.parse_args().affinity_cache_discount_alpha == 0.3
+
+
 def test_parse_args_rejects_overload_factor_between_zero_and_one(monkeypatch):
     monkeypatch.setattr(
         sys,

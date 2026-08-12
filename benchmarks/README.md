@@ -630,7 +630,12 @@ candidate source with KV-aware routing on: A and B keep the guards disabled
 (A versus B is the same-policy noise control) while C enables
 the guards (override the defaults 1.5 / 3 by exporting
 `AFFINITY_OVERLOAD_FACTOR` and `AFFINITY_MISS_UNBIND_THRESHOLD`); A versus C
-then isolates the guard mechanisms.
+then isolates the guard mechanisms. Export `AFFINITY_CACHE_DISCOUNT_ALPHA`
+(default 0 = off) to also enable cache-discounted reservations on C:
+affinity-hit compute reservations are scaled by the per-binding EMA of
+observed cached/prompt token ratio (KV pressure stays full-cost since the
+decoder needs the complete prompt KV either way), so the overload guard
+compares real compute instead of raw prompt size.
 Set a different integer `WORKLOAD_SEED` on every repetition; it overrides only
 the generated workload and is recorded in `metadata.json` and the workload
 manifest. Start with the first three cyclic Latin-square rows below so every
