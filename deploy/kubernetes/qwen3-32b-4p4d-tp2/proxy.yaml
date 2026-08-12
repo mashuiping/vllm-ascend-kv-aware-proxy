@@ -47,7 +47,6 @@ spec:
             - {name: AFFINITY_OVERLOAD_FACTOR, value: "__AFFINITY_OVERLOAD_FACTOR__"}
             - {name: AFFINITY_MISS_UNBIND_THRESHOLD, value: "__AFFINITY_MISS_UNBIND_THRESHOLD__"}
             - {name: AFFINITY_CACHE_DISCOUNT_ALPHA, value: "__AFFINITY_CACHE_DISCOUNT_ALPHA__"}
-            - {name: AFFINITY_CACHE_DISCOUNT_ALPHA, value: "__AFFINITY_CACHE_DISCOUNT_ALPHA__"}
           args:
             - --host
             - 0.0.0.0
