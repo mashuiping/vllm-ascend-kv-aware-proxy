@@ -44,7 +44,6 @@ spec:
             - {name: PREFIX_HASH_CHARS, value: "__PREFIX_HASH_CHARS__"}
             - {name: PREFIX_LRU_SIZE, value: "__PREFIX_LRU_SIZE__"}
             - {name: PREFILL_ACTIVE_TOKEN_WEIGHT, value: "__PREFILL_ACTIVE_TOKEN_WEIGHT__"}
-            - {name: AFFINITY_OVERLOAD_FACTOR, value: "__AFFINITY_OVERLOAD_FACTOR__"}
             - {name: AFFINITY_MISS_UNBIND_THRESHOLD, value: "__AFFINITY_MISS_UNBIND_THRESHOLD__"}
             - {name: AFFINITY_CACHE_DISCOUNT_ALPHA, value: "__AFFINITY_CACHE_DISCOUNT_ALPHA__"}
           args:

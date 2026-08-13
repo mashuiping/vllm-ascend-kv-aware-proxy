@@ -78,7 +78,6 @@ Important optional settings:
 | `PREFIX_HASH_CHARS` | `1024` |
 | `PREFIX_LRU_SIZE` | `1024` |
 | `PREFILL_ACTIVE_TOKEN_WEIGHT` | `1.0` |
-| `AFFINITY_OVERLOAD_FACTOR` | `0` (guard off) |
 | `AFFINITY_MISS_UNBIND_THRESHOLD` | `0` (guard off) |
 | `AFFINITY_CACHE_DISCOUNT_ALPHA` | `0` (discount off) |
 

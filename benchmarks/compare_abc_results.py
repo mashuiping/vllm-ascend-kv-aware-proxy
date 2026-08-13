@@ -97,7 +97,10 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
             except (TypeError, ValueError):
                 off_weight = on_weight = -1.0
 
-            def guard_values(group: str) -> tuple[float, float, float]:
+            # The overload escape valve was removed in 0.2.x (experiments only
+            # showed false-positive escapes; see docs/design.md), so guard
+            # identity now covers miss-unbind and the cache-discount alpha.
+            def guard_values(group: str) -> tuple[float, float]:
                 identity = identities[group]
 
                 def field(name: str) -> float:
@@ -107,7 +110,6 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
                         return -1.0
 
                 return (
-                    field("actual_affinity_overload_factor"),
                     field("actual_affinity_miss_unbind_threshold"),
                     # Absent in identities recorded before the cache-discount
                     # mechanism existed; those proxies ran with it disabled.
@@ -140,8 +142,8 @@ def build_comparison(experiment_dir: Path) -> dict[str, Any]:
                     all(identities[group].get("actual_variant") == "candidate" for group in GROUPS)
                     and all(identities[group].get("actual_kv_aware") == "true" for group in GROUPS)
                     and off_weight == on_weight
-                    and baseline_guards == (0.0, 0.0, 0.0)
-                    and off_guards == (0.0, 0.0, 0.0)
+                    and baseline_guards == (0.0, 0.0)
+                    and off_guards == (0.0, 0.0)
                     and any(value > 0.0 for value in on_guards)
                 )
             else:

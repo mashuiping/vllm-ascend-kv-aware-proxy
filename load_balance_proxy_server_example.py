@@ -192,17 +192,14 @@ SESSION_HEADER_NAMES: tuple[str, ...] = (
     "session_id",
 )
 PREFIX_HASH_VERSION = "pd-prefix-v1"
-# Overload slack expressed in units of the incoming request's own score.
-# A fixed absolute margin degenerates under skewed load: when the other
-# Prefillers are idle, min_live_priority is ~0 and the multiplicative factor
-# contributes nothing, so any in-flight work on the bound node would trigger
-# escape (observed on shared-prefix-zipf: ~30% of hits overflowed while the
-# prefill queue was empty). Scaling the margin by the request score means
-# "overloaded" requires a backlog worth several requests of this size, which
-# an idle peer cannot fake.
-AFFINITY_OVERLOAD_MARGIN_REQUESTS = 4.0
-# Floor keeps the near-zero protection even for degenerate tiny scores.
-AFFINITY_OVERLOAD_MARGIN_FLOOR = 1.0
+# NOTE: an affinity overload escape valve (--affinity-overload-factor) was
+# implemented and removed in 0.2.x. Instantaneous priority comparison cannot
+# distinguish Poisson bursts from real backlog: A/B/C experiments
+# (shared-prefix-zipf, shared-prefix-capacity-zipf @ tag 0.2.0) showed only
+# false-positive escapes that recomputed large prefixes on cold nodes and cost
+# up to +15% TTFT p95 with zero scenarios where prefill backlog materialised
+# (affinity itself keeps prefill cheap). A future escape valve must be driven
+# by a backlog signal such as reported queue time. See docs/design.md.
 # A cache-discounted reservation never drops below this fraction of the full
 # score: even a 100%-cached prompt still costs scheduling, attention over the
 # cached prefix and KV-transfer setup.
@@ -513,7 +510,6 @@ class SharedProxyScheduler:
         session_lru_size: int = 4096,
         prefix_lru_size: int = 1024,
         prefill_active_token_weight: float = 1.0,
-        affinity_overload_factor: float = 0.0,
         affinity_miss_unbind_threshold: int = 0,
         affinity_cache_discount_alpha: float = 0.0,
     ):
@@ -528,7 +524,6 @@ class SharedProxyScheduler:
         self.session_lru_size = max(0, int(session_lru_size))
         self.prefix_lru_size = max(0, int(prefix_lru_size))
         self.prefill_active_token_weight = max(0.0, float(prefill_active_token_weight))
-        self.affinity_overload_factor = max(0.0, float(affinity_overload_factor))
         self.affinity_miss_unbind_threshold = max(0, int(affinity_miss_unbind_threshold))
         self.affinity_cache_discount_alpha = min(1.0, max(0.0, float(affinity_cache_discount_alpha)))
         self.session_lru: OrderedDict[str, str] = OrderedDict()
@@ -559,7 +554,6 @@ class SharedProxyScheduler:
         return {
             "hits": 0,
             "binds": 0,
-            "overflows": 0,
             "unbinds_lru": 0,
             "unbinds_taint": 0,
             "unbinds_miss": 0,
@@ -659,7 +653,6 @@ class SharedProxyScheduler:
                 "decode_instances": len(self.decoders),
                 "request_num": self.request_num,
                 "prefill_active_token_weight": self.prefill_active_token_weight,
-                "affinity_overload_factor": self.affinity_overload_factor,
                 "affinity_miss_unbind_threshold": self.affinity_miss_unbind_threshold,
                 "affinity_cache_discount_alpha": self.affinity_cache_discount_alpha,
                 "prefill_routing_stats": dict(self.prefill_routing_stats),
@@ -738,8 +731,8 @@ class SharedProxyScheduler:
 
         A bound node's cached prefix means the real prefill compute is roughly
         (1 - hit_ratio) of the full prompt. Reserving the full score makes the
-        node look busier than it is, which biases the overload guard against
-        exactly the nodes affinity is helping.
+        node look busier than it is, which biases heap routing of new bindings
+        away from exactly the nodes affinity is helping.
         """
         if self.affinity_cache_discount_alpha <= 0 or not affinity_key:
             return 1.0
@@ -747,29 +740,6 @@ class SharedProxyScheduler:
         if ema is None:
             return 1.0
         return max(AFFINITY_DISCOUNT_MIN_FRACTION, 1.0 - ema)
-
-    def _min_live_prefill_priority_no_lock(self) -> float | None:
-        pool = self._pool(ServerRole.PREFILL)
-        live = [
-            self._priority(ServerRole.PREFILL, entry, key)
-            for key, entry in self.prefillers.items()
-            if key not in pool.tainted
-        ]
-        return min(live) if live else None
-
-    def _affinity_overloaded_no_lock(self, prefiller_key: str, compute_load: float) -> bool:
-        if self.affinity_overload_factor <= 0:
-            return False
-        pool = self._pool(ServerRole.PREFILL)
-        entry = pool.servers.get(prefiller_key)
-        if entry is None or prefiller_key in pool.tainted:
-            return True
-        bound_priority = self._priority(ServerRole.PREFILL, entry, prefiller_key)
-        min_priority = self._min_live_prefill_priority_no_lock()
-        if min_priority is None:
-            return False
-        margin = max(AFFINITY_OVERLOAD_MARGIN_REQUESTS * compute_load, AFFINITY_OVERLOAD_MARGIN_FLOOR)
-        return bound_priority > min_priority * self.affinity_overload_factor + margin
 
     def _resolve_affinity_no_lock(
         self,
@@ -836,20 +806,12 @@ class SharedProxyScheduler:
         prefiller_key = self._resolve_affinity_no_lock(self.session_lru, session_key, kind="session")
         if prefiller_key is not None:
             self.session_affinity_stats["hits"] += 1
-            if self._affinity_overloaded_no_lock(prefiller_key, compute_load):
-                self.session_affinity_stats["overflows"] += 1
-                route_source = "session-overflow"
-                prefiller_key = None
-        if prefiller_key is None and route_source != "session-overflow":
+        if prefiller_key is None:
             route_source = "prefix"
             prefiller_key = self._resolve_affinity_no_lock(self.prefix_lru, prefix_key, kind="prefix")
             if prefiller_key is not None:
                 self.prefix_affinity_stats["hits"] += 1
-                if self._affinity_overloaded_no_lock(prefiller_key, compute_load):
-                    self.prefix_affinity_stats["overflows"] += 1
-                    route_source = "prefix-overflow"
-                    prefiller_key = None
-        if prefiller_key is None and route_source not in ("session-overflow", "prefix-overflow"):
+        if prefiller_key is None:
             route_source = "heap"
         # Affinity hits reserve a cache-discounted compute cost so accounting
         # tracks real prefill work. KV is deliberately NOT discounted: a prefix
@@ -876,7 +838,7 @@ class SharedProxyScheduler:
         picked["route_source"] = route_source
         picked["compute_load"] = effective_compute_load
         picked["kv_load"] = effective_kv_load
-        if route_source in ("heap", "session-overflow", "prefix-overflow"):
+        if route_source == "heap":
             self._record_heap_shadow_stats_no_lock(picked["key"])
         return picked
 
@@ -972,8 +934,7 @@ class SharedProxyScheduler:
             # When an existing session wins over a conflicting prefix mapping,
             # keep the prefix owner stable. Rebinding it on every session hit
             # would make the one-node prefix LRU flap between Prefillers.
-            # Overflow and heap paths rebind so the abandoned hot node loses
-            # ownership.
+            # Heap-routed requests rebind so a stale mapping self-corrects.
             if prefix_key and route_source != "session":
                 self._bind_affinity_no_lock(
                     self.prefix_lru,
@@ -1009,7 +970,7 @@ class SharedProxyScheduler:
             if affinity_key not in mapping:
                 return
             # An outcome observed on a node the mapping no longer points at
-            # (e.g. an overflow rebound the key mid-flight) must not count
+            # (e.g. a heap route rebound the key mid-flight) must not count
             # against — or unbind — the fresh binding.
             if prefiller_key is not None and mapping.get(affinity_key) != prefiller_key:
                 return
@@ -1407,17 +1368,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--affinity-overload-factor",
-        type=float,
-        default=0.0,
-        help=(
-            "Escape affinity when the bound Prefiller priority exceeds "
-            "min_live_priority * factor + margin, where margin scales with the "
-            "incoming request's own score so idle peers alone cannot trigger "
-            "escape. 0 disables the guard; enabled values must be >= 1."
-        ),
-    )
-    parser.add_argument(
         "--affinity-miss-unbind-threshold",
         type=int,
         default=0,
@@ -1447,10 +1397,6 @@ def parse_args() -> argparse.Namespace:
     args.prefix_lru_size = max(0, args.prefix_lru_size)
     if not math.isfinite(args.prefill_active_token_weight) or args.prefill_active_token_weight < 0:
         raise ValueError("prefill active-token weight must be finite and non-negative")
-    if not math.isfinite(args.affinity_overload_factor) or args.affinity_overload_factor < 0:
-        raise ValueError("affinity overload factor must be finite and non-negative")
-    if 0 < args.affinity_overload_factor < 1:
-        raise ValueError("affinity overload factor must be 0 (disabled) or >= 1")
     if (
         not math.isfinite(args.affinity_cache_discount_alpha)
         or not 0.0 <= args.affinity_cache_discount_alpha <= 1.0
@@ -1468,7 +1414,6 @@ def _scheduler_affinity_kwargs(args: argparse.Namespace) -> dict[str, int | floa
         "session_lru_size": args.session_lru_size,
         "prefix_lru_size": args.prefix_lru_size,
         "prefill_active_token_weight": args.prefill_active_token_weight,
-        "affinity_overload_factor": args.affinity_overload_factor,
         "affinity_miss_unbind_threshold": args.affinity_miss_unbind_threshold,
         "affinity_cache_discount_alpha": args.affinity_cache_discount_alpha,
     }

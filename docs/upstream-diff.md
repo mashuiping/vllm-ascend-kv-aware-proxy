@@ -43,7 +43,8 @@ Its functional changes are intentionally limited to the following areas.
 ## Deliberately deferred
 
 - Hot-prefix replication or multi-node buckets.
-- Overload spillover from a live affinity owner.
+- Overload spillover from a live affinity owner (a priority-comparison escape
+  valve was tried and removed in 0.2.x; see docs/design.md).
 - Prometheus metrics and dashboards.
 - Model-specific multimodal/tool prefix canonicalization.
 - Distributed affinity state outside the proxy's shared scheduler process.

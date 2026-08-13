@@ -16,9 +16,10 @@ in this directory alongside the checked-in workload profiles.
 | `session-affinity.json`       | 60 sessions, 5 turns, 2,048-token system prompt, 200-token turn input, concurrency 20           | Higress-style multi-turn session locality |
 | `shared-prefix-capacity.json` | 32 groups × 8 prompts, one prime plus one prefix probe per group, 2,048-token shared prefix, 256-token unique question, Poisson QPS ladder | llm-d-style cross-session prefix locality |
 | `load-balance-active-tokens.json` | Unique 512/2,048/4,096-token prompt classes, 2/3/4.5 QPS for 30/60/90 seconds, concurrency 192, 256-token outputs, Proxy uses 2 Decoders | Targeted Prefill active-token lifecycle validation around the measured capacity knee |
-| `session-affinity-zipf.json`  | Same shape as `session-affinity.json` but measure-turn traffic is Zipf-skewed (`zipf_alpha` 1.2) onto hot sessions | Single-node hot-spot pressure for the affinity overload guard |
-| `shared-prefix-zipf.json`     | 32 groups × 8 prompts, QPS-stage group selection Zipf-skewed (`zipf_alpha` 1.2)                 | Cross-session hot-prefix pressure for the overload guard |
+| `session-affinity-zipf.json`  | Same shape as `session-affinity.json` but measure-turn traffic is Zipf-skewed (`zipf_alpha` 1.2) onto hot sessions | Single-node hot-spot pressure for affinity-guard experiments |
+| `shared-prefix-zipf.json`     | 32 groups × 8 prompts, QPS-stage group selection Zipf-skewed (`zipf_alpha` 1.2)                 | Cross-session hot-prefix pressure for affinity-guard experiments |
 | `shared-prefix-capacity-pressure.json` | 96 groups × 8,192-token shared prefix (~786K prefix tokens total), Poisson QPS ladder up to 20 | KV eviction churn: total prefix corpus sized to 2–3× one node's KV capacity |
+| `shared-prefix-capacity-zipf.json` | Capacity-pressure working set plus `zipf_alpha` 1.2 hot groups, QPS ladder up to 30 | Saturate a single hot Prefiller under KV pressure (used to falsify the removed overload escape valve) |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 The Zipf profiles set the optional `data.zipf_alpha` field: after a first
@@ -640,35 +641,33 @@ automatic `active-token` mode makes A exact upstream, B candidate weight=0 and
 C candidate weight=1; B versus C then isolates the active-token lifecycle.
 Setting `ABC_COMPARISON_MODE=affinity-guard` makes all three groups run the
 candidate source with KV-aware routing on: A and B keep the guards disabled
-(A versus B is the same-policy noise control) while C enables
-the guards (override the defaults 1.5 / 3 by exporting
-`AFFINITY_OVERLOAD_FACTOR` and `AFFINITY_MISS_UNBIND_THRESHOLD`); A versus C
-then isolates the guard mechanisms. Export `AFFINITY_CACHE_DISCOUNT_ALPHA`
-(default 0 = off) to also enable cache-discounted reservations on C:
-affinity-hit compute reservations are scaled by the per-binding EMA of
-observed cached/prompt token ratio (KV pressure stays full-cost since the
-decoder needs the complete prompt KV either way), so the overload guard
-compares real compute instead of raw prompt size.
+(A versus B is the same-policy noise control) while C enables miss-unbind
+(override the default 3 by exporting `AFFINITY_MISS_UNBIND_THRESHOLD`);
+A versus C then isolates the guard mechanisms. Export
+`AFFINITY_CACHE_DISCOUNT_ALPHA` (default 0 = off) to also enable
+cache-discounted reservations on C: affinity-hit compute reservations are
+scaled by the per-binding EMA of observed cached/prompt token ratio (KV
+pressure stays full-cost since the decoder needs the complete prompt KV
+either way), so load accounting tracks real compute instead of raw prompt
+size.
 
-A typical overload-guard experiment pairs affinity-guard mode with a Zipf
-profile. Without the cache discount, reservations over-state the load of
-highly-cached bound nodes, so start the factor at 3 or higher; with the
-discount enabled the accounting tracks real compute and smaller factors
-become meaningful:
+This mode previously also drove an overload escape valve
+(`AFFINITY_OVERLOAD_FACTOR`), removed in 0.2.x after the runs it was built
+for falsified it: every escape was a false positive on burst imbalance, and
+no run produced a genuinely backlogged hot Prefiller (see docs/design.md,
+"Affinity robustness guards").
 
 ```bash
 ABC_COMPARISON_MODE=affinity-guard \
-AFFINITY_OVERLOAD_FACTOR=3 \
 AFFINITY_MISS_UNBIND_THRESHOLD=3 \
 AFFINITY_CACHE_DISCOUNT_ALPHA=0.3 \
 MODEL=qwen3-32b PREFILL_NODE=<node> \
   bash benchmarks/run_abc_experiment.sh benchmarks/profiles/shared-prefix-zipf.json
 ```
 
-When judging guard runs, look beyond the latency deltas: high
-`session/prefix_affinity_stats.overflows` with a falling cached/prompt ratio
-in `prefill_cache_stats_by_source` for the session/prefix sources means the
-guard is evicting healthy bindings rather than relieving a real hot spot.
+When judging guard runs, watch `unbinds_miss` together with the
+cached/prompt ratio in `prefill_cache_stats_by_source`: unbinds without a
+recovering hit ratio mean the threshold is churning healthy bindings.
 
 Set a different integer `WORKLOAD_SEED` on every repetition; it overrides only
 the generated workload and is recorded in `metadata.json` and the workload

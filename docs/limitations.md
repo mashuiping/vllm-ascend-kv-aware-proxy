@@ -3,9 +3,13 @@
 ## A live binding currently wins over load
 
 Session and prefix hits remain on their bound Prefiller while it is live and not
-draining. There is no overload spillover in the minimal candidate. A hot session
-or prefix can therefore create a hotspot. Always include a hot-key negative
-test, watch tail latency and bound client concurrency.
+draining; there is no load-based spillover. An overload escape valve was tried
+and removed in 0.2.x: instantaneous priority comparison only produced
+false-positive escapes, and experiments showed a genuinely backlogged hot
+Prefiller does not materialise while affinity keeps its cache hot (see
+docs/design.md). A hot session or prefix can still create a hotspot in
+principle. Always include a hot-key negative test, watch tail latency and
+bound client concurrency.
 
 ## Affinity is an in-memory hint
 

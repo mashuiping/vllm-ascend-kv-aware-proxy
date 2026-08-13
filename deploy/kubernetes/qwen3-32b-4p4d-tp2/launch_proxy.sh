@@ -66,7 +66,6 @@ if [[ "${KV_AWARE_ROUTING}" == "true" ]]; then
     --session-lru-size "${SESSION_LRU_SIZE:-4096}"
     --prefix-hash-chars "${PREFIX_HASH_CHARS:-1024}"
     --prefix-lru-size "${PREFIX_LRU_SIZE:-1024}"
-    --affinity-overload-factor "${AFFINITY_OVERLOAD_FACTOR:-0}"
     --affinity-miss-unbind-threshold "${AFFINITY_MISS_UNBIND_THRESHOLD:-0}"
     --affinity-cache-discount-alpha "${AFFINITY_CACHE_DISCOUNT_ALPHA:-0}"
   )

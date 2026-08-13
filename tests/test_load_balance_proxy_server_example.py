@@ -733,8 +733,11 @@ def test_assign_instances_with_gate_on_binds_and_warns_when_details_missing(monk
     assert any("reusable_prefix_tokens" in record.getMessage() for record in caplog.records)
 
 
-def test_affinity_overload_factor_zero_preserves_bound_prefiller():
-    scheduler = make_scheduler(affinity_overload_factor=0.0)
+def test_affinity_holds_regardless_of_load_imbalance():
+    """Affinity is never escaped on load signals: the 0.2.x overload guard was
+    removed after A/B/C runs showed only false-positive escapes (see
+    docs/design.md, "Affinity robustness guards")."""
+    scheduler = make_scheduler()
     first = scheduler.begin_request(10.0, 10.0, "session")
     scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
     bound = first["key"]
@@ -746,74 +749,7 @@ def test_affinity_overload_factor_zero_preserves_bound_prefiller():
     assert hit["route_source"] == "session"
     assert hit["key"] == bound
     assert scheduler.session_affinity_stats["hits"] == 1
-    assert scheduler.session_affinity_stats["overflows"] == 0
     scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
-
-
-def test_affinity_overload_guard_escapes_and_rebinds():
-    scheduler = make_scheduler(affinity_overload_factor=1.5)
-    first = scheduler.begin_request(10.0, 10.0, "session")
-    scheduler.complete_prefill(first["key"], 10.0, "session", None, route_source="heap")
-    bound = first["key"]
-    other = next(key for key in scheduler.prefillers if key != bound)
-    # Bound node carries high KV pressure; the idle peer is the escape target.
-    scheduler.prefillers[bound].active_tokens = 0.0
-    scheduler.prefillers[bound].active_kv_cache = 10_000.0
-    scheduler.prefillers[other].active_tokens = 0.0
-    scheduler.prefillers[other].active_kv_cache = 0.0
-    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
-
-    escaped = scheduler.begin_request(1.0, 1.0, "session")
-    assert escaped["route_source"] == "session-overflow"
-    assert escaped["key"] == other
-    assert scheduler.session_affinity_stats["hits"] == 1
-    assert scheduler.session_affinity_stats["overflows"] == 1
-    scheduler.complete_prefill(escaped["key"], 1.0, "session", None, route_source="session-overflow")
-    assert scheduler.session_lru["session"] == other
-
-
-def test_affinity_overload_does_not_trigger_near_zero_priorities():
-    scheduler = make_scheduler(affinity_overload_factor=1.5)
-    first = scheduler.begin_request(1.0, 1.0, "session")
-    scheduler.complete_prefill(first["key"], 1.0, "session", None, route_source="heap")
-    bound = first["key"]
-
-    hit = scheduler.begin_request(1.0, 1.0, "session")
-    assert hit["route_source"] == "session"
-    assert hit["key"] == bound
-    assert scheduler.session_affinity_stats["overflows"] == 0
-    scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
-
-
-def test_affinity_overload_ignores_idle_peers_without_real_backlog():
-    """Regression: with idle peers min_live_priority is ~0 and a fixed tiny
-    margin let any in-flight work trigger escape (shared-prefix-zipf run
-    20260813: ~30% of hits overflowed while the prefill queue was empty)."""
-    scheduler = make_scheduler(affinity_overload_factor=3.0)
-    first = scheduler.begin_request(100.0, 100.0, "session")
-    scheduler.complete_prefill(first["key"], 100.0, "session", None, route_source="heap")
-    bound = first["key"]
-    other = next(key for key in scheduler.prefillers if key != bound)
-    scheduler.prefillers[other].active_tokens = 0.0
-    scheduler.prefillers[other].active_kv_cache = 0.0
-
-    # Bound node carries less than the 4-requests margin worth of backlog:
-    # priority = 300 < 0 * 3 + 4 * 100. Affinity must hold.
-    scheduler.prefillers[bound].active_tokens = 300.0
-    scheduler.prefillers[bound].active_kv_cache = 0.0
-    held = scheduler.begin_request(100.0, 100.0, "session")
-    assert held["route_source"] == "session"
-    assert held["key"] == bound
-    assert scheduler.session_affinity_stats["overflows"] == 0
-    scheduler.complete_prefill(held["key"], held["compute_load"], "session", None, route_source="session")
-
-    # A genuine backlog beyond the margin still escapes.
-    scheduler.prefillers[bound].active_tokens = 900.0
-    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
-    escaped = scheduler.begin_request(100.0, 100.0, "session")
-    assert escaped["route_source"] == "session-overflow"
-    assert escaped["key"] == other
-    assert scheduler.session_affinity_stats["overflows"] == 1
 
 
 def test_affinity_miss_unbind_requires_consecutive_zero_cached_tokens():
@@ -869,7 +805,6 @@ def test_healthcheck_exposes_affinity_stats_and_cache_by_source():
     scheduler.observe_affinity_outcome("session", "session", 12, 40)
 
     health = scheduler.healthcheck()
-    assert health["affinity_overload_factor"] == 0.0
     assert health["affinity_miss_unbind_threshold"] == 1
     assert health["session_affinity_stats"]["hits"] >= 1
     assert health["session_affinity_stats"]["binds"] >= 1
@@ -877,27 +812,6 @@ def test_healthcheck_exposes_affinity_stats_and_cache_by_source():
     assert health["prefill_cache_stats_by_source"]["session"]["cached_tokens"] == 12
     assert health["prefill_cache_stats_by_source"]["session"]["prompt_tokens"] == 40
     assert health["prefill_cache_stats_by_source"]["session"]["requests"] == 1
-
-
-def test_prefix_affinity_overload_guard_escapes_and_rebinds():
-    scheduler = make_scheduler(affinity_overload_factor=1.5)
-    first = scheduler.begin_request(10.0, 10.0, None, "prefix")
-    scheduler.complete_prefill(first["key"], 10.0, None, "prefix", route_source="heap")
-    bound = first["key"]
-    other = next(key for key in scheduler.prefillers if key != bound)
-    scheduler.prefillers[bound].active_tokens = 0.0
-    scheduler.prefillers[bound].active_kv_cache = 10_000.0
-    scheduler.prefillers[other].active_tokens = 0.0
-    scheduler.prefillers[other].active_kv_cache = 0.0
-    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
-
-    escaped = scheduler.begin_request(1.0, 1.0, None, "prefix")
-    assert escaped["route_source"] == "prefix-overflow"
-    assert escaped["key"] == other
-    assert scheduler.prefix_affinity_stats["hits"] == 1
-    assert scheduler.prefix_affinity_stats["overflows"] == 1
-    scheduler.complete_prefill(escaped["key"], 1.0, None, "prefix", route_source="prefix-overflow")
-    assert scheduler.prefix_lru["prefix"] == other
 
 
 def test_miss_unbind_ignores_outcome_from_node_mapping_no_longer_points_at():
@@ -997,24 +911,6 @@ def test_cache_discount_applies_to_prefix_affinity_hits():
     assert hit["kv_load"] == pytest.approx(100.0)
 
 
-def test_overflow_route_reserves_full_cost_despite_cache_ema():
-    scheduler = make_scheduler(affinity_overload_factor=1.5, affinity_cache_discount_alpha=0.5)
-    keys = list(scheduler.prefillers)
-    scheduler._bind_affinity_no_lock(scheduler.session_lru, "session", keys[0], 4, kind="session")
-    scheduler.observe_affinity_outcome("session", "session", 90, 100, prefiller_key=keys[0])
-    # Overload the bound node so the guard escapes to the idle peer.
-    scheduler.prefillers[keys[0]].active_kv_cache = 10_000.0
-    scheduler.prefillers[keys[1]].active_kv_cache = 0.0
-    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
-
-    escaped = scheduler.begin_request(100.0, 100.0, "session")
-    assert escaped["route_source"] == "session-overflow"
-    assert escaped["key"] == keys[1]
-    # The escape target has no cache for this session; full cost applies.
-    assert escaped["compute_load"] == pytest.approx(100.0)
-    assert escaped["kv_load"] == pytest.approx(100.0)
-
-
 def test_cache_discount_ema_resets_when_binding_moves_to_another_node():
     scheduler = make_scheduler(affinity_cache_discount_alpha=0.5)
     keys = list(scheduler.prefillers)
@@ -1045,19 +941,11 @@ def test_parse_args_rejects_cache_discount_alpha_outside_unit_interval(monkeypat
     assert proxy.parse_args().affinity_cache_discount_alpha == 0.3
 
 
-def test_parse_args_rejects_overload_factor_between_zero_and_one(monkeypatch):
+def test_parse_args_rejects_removed_overload_factor_flag(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["load_balance_proxy_server_example.py", "--affinity-overload-factor", "0.5"],
+        ["load_balance_proxy_server_example.py", "--affinity-overload-factor", "3"],
     )
-    with pytest.raises(ValueError, match="0 \\(disabled\\) or >= 1"):
+    with pytest.raises(SystemExit):
         proxy.parse_args()
-
-    for valid_value in ("0", "1", "1.5"):
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            ["load_balance_proxy_server_example.py", "--affinity-overload-factor", valid_value],
-        )
-        assert proxy.parse_args().affinity_overload_factor == float(valid_value)

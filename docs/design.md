@@ -122,34 +122,40 @@ only an on/off comparison.
 
 Plain affinity never lets go: a bound Prefiller keeps receiving its
 session/prefix traffic regardless of load, and a binding whose KV was evicted
-is only cleared by LRU pressure. Three independent, opt-in mechanisms address
-this. All default to off, preserving the exact pre-guard behavior.
+is only cleared by LRU pressure. Two independent, opt-in mechanisms address
+this. Both default to off, preserving the exact pre-guard behavior.
 
-### Overload escape (`--affinity-overload-factor`)
+### Removed: overload escape (`--affinity-overload-factor`, 0.1.0–0.2.0)
 
-On an affinity hit the scheduler compares the bound Prefiller's priority with
-the minimum priority across live Prefillers:
+A third guard existed through tag `0.2.0`: on an affinity hit the scheduler
+compared the bound Prefiller's priority against
+`min_live_priority * factor + margin` and, when exceeded, overflowed the
+request to the load heap and rebound the key there. It was removed after two
+rounds of A/B/C experiments falsified its premise:
 
-```text
-margin     = max(4 * request_score, 1.0)
-overloaded = bound_priority > min_live_priority * factor + margin
-```
+- **The signal cannot work.** Reservation-based priority is an instantaneous
+  snapshot, so the comparison measures momentary Poisson-burst imbalance, not
+  queueing backlog. A first fixed-margin version escaped on ~30% of prefix
+  hits with an empty prefill queue (shared-prefix-zipf); after rescaling the
+  margin to several requests' worth of score, a capacity-pressure Zipf run at
+  qps-30 still produced 50 escapes — every one at a moment when the bound
+  node merely held a burst of in-flight work while another node was
+  momentarily idle.
+- **The protected scenario cannot materialise.** Affinity keeps the hit ratio
+  at 95%+, so even 8K-token prompts cost ~400 computed tokens and the hot
+  node absorbs a 27% traffic share with ~0.05s prefill queue at qps-30. The
+  bottleneck stays on the decode side; a genuinely backlogged hot prefiller
+  never appeared in any run.
+- **Each false escape is expensive.** The escape rebinds the key, so the hot
+  prefix is recomputed and duplicated on the new node. Under KV capacity
+  pressure the duplicate evicts other groups' prefixes: 50 escapes (1.2% of
+  hits) cost 2pp of global cache hit ratio, +40% mean prefill computed
+  tokens, and +15% TTFT p95 at qps-10/20.
 
-If overloaded, the request overflows to the load heap (`route_source` becomes
-`session-overflow` / `prefix-overflow`) and, after a successful Prefill,
-rebinds to the node the heap picked, so the abandoned hot node loses
-ownership. `0` disables the guard; enabled values must be ≥ 1, otherwise the
-guard would flag even the least-loaded node as overloaded.
-
-The margin scales with the incoming request's own score rather than being a
-fixed constant. Under skewed (Zipf-like) load the non-hot Prefillers are
-idle, so `min_live_priority` is ~0 and the multiplicative factor contributes
-nothing; a fixed tiny margin then lets any in-flight work on the bound node
-trigger escape even though nothing is queued (observed empirically:
-~30% of prefix hits overflowed with an empty prefill queue, costing 6pp of
-cache hit ratio and +20-28% TTFT p95). Requiring a backlog worth several
-requests of the current size means an idle peer alone can never fake an
-overload signal.
+A future escape valve must consume a real backlog signal (e.g. per-node
+prefill queue time with hysteresis), not instantaneous priority. The full
+implementation is preserved at tag `0.2.0`; the experiment runs live in
+`results/runs/20260813T*`.
 
 ### Miss-unbind (`--affinity-miss-unbind-threshold`)
 
@@ -157,14 +163,14 @@ Every Prefill response reports `cached_tokens`. If an affinity-routed request
 observes `cached_tokens == 0` for N consecutive outcomes, the binding is
 dropped and the next request rebinds through the heap. The counter resets on
 any cache hit, and an outcome from a node the mapping no longer points at
-(for example after a mid-flight overflow rebind) is ignored so a fresh binding
+(for example after a mid-flight heap rebind) is ignored so a fresh binding
 is never punished for a stale result. `0` disables miss-based unbind.
 
 ### Cache-discounted reservations (`--affinity-cache-discount-alpha`)
 
 Load accounting reserves a score derived from raw prompt length, but a highly
 cached prompt costs a fraction of that compute. The bias lands exactly on the
-nodes affinity favors, so the overload guard would escape healthy bindings.
+nodes affinity favors, steering heap-routed new bindings away from them.
 With alpha > 0, each binding tracks an EMA of the observed
 `cached_tokens / prompt_tokens` ratio and affinity-hit reservations reserve
 compute at `max(0.1, 1 - ema)` of the full score.
@@ -179,8 +185,8 @@ all clear it.
 
 ### Observability
 
-`/healthcheck` exposes per-kind affinity stats (`hits`, `binds`, `overflows`,
-and unbind counts split by LRU / taint / miss) plus
+`/healthcheck` exposes per-kind affinity stats (`hits`, `binds`, and unbind
+counts split by LRU / taint / miss) plus
 `prefill_cache_stats_by_source`, which aggregates `cached_tokens` and
 `prompt_tokens` per route source so guard behavior can be attributed in
 experiments.
