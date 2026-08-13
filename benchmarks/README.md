@@ -598,8 +598,9 @@ artifacts. It does not load JavaScript or assets from an external network.
 
 ### 7. Recover or clean up a failed run
 
-Failed runs retain the Benchmark Pod and ConfigMap. The harness prints commands
-like these for inspection and artifact recovery:
+Failed runs retry the result copy once after 10s (`RETRY_DELAY_SECONDS`).
+If that still fails, the harness retains the Benchmark Pod and ConfigMap and
+prints commands like these for inspection and artifact recovery:
 
 ```bash
 kubectl -n qwen-pd get pods -l app.kubernetes.io/name=pd-benchmark

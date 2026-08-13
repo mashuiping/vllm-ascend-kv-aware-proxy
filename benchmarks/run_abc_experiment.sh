@@ -51,6 +51,18 @@ log() {
   printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
 }
 
+# Transient kubectl/API blips are common after long runs. Retry once after a
+# short delay; callers must be idempotent (overwrite the same objects/files).
+retry_once() {
+  local delay="${RETRY_DELAY_SECONDS:-10}"
+  if "$@"; then
+    return 0
+  fi
+  log "command failed; sleeping ${delay}s then retrying once"
+  sleep "${delay}"
+  "$@"
+}
+
 escape_sed_replacement() {
   printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'
 }
@@ -352,6 +364,10 @@ run_in_pod() {
   local tokenizer_url="${IN_CLUSTER_TOKENIZER_URL:-http://pd-prefill-0.pd-prefill:7100}"
   local base_url="${IN_CLUSTER_BASE_URL:-http://pd-proxy:8000}"
   local benchmark_manifest="${DEPLOY_DIR}/benchmark-pod.yaml"
+  local archive_name="benchmark-results.tar.gz"
+  local remote_archive="/tmp/${archive_name}"
+  local local_archive="${experiment_dir}/${archive_name}"
+  local results_copied=false
   local -a backend_args=()
   local index
   for index in 0 1 2 3; do
@@ -364,17 +380,45 @@ run_in_pod() {
     backend_args+=(--decode-metrics-url "http://pd-decode-${index}.pd-decode:7200/metrics")
   done
 
+  # Overwrite the same archive/files on every attempt so a partial kubectl cp
+  # can be retried without leaving a corrupt local tarball.
+  copy_pod_results() {
+    log "archiving benchmark artifacts inside pod"
+    kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+      tar -C /results -czf "${remote_archive}" .
+    rm -f "${local_archive}"
+    log "copying compressed archive to ${local_archive}"
+    kubectl -n "${NAMESPACE}" cp "${pod_name}:${remote_archive}" "${local_archive}"
+    tar -tzf "${local_archive}" >/dev/null
+    log "extracting archive into ${experiment_dir}"
+    tar -xzf "${local_archive}" -C "${experiment_dir}"
+    rm -f "${local_archive}"
+    results_copied=true
+  }
+
   on_exit() {
     local status=$?
-    if (( status != 0 )); then
-      log "benchmark failed; keeping pod/${pod_name} and configmap/${configmap_name} for inspection"
-      log "inspect with: kubectl -n ${NAMESPACE} exec -it ${pod_name} -- bash"
-      log "recover results with:"
-      log "  kubectl -n ${NAMESPACE} exec ${pod_name} -- tar -C /results -czf /tmp/benchmark-results.tar.gz ."
-      log "  kubectl -n ${NAMESPACE} cp ${pod_name}:/tmp/benchmark-results.tar.gz ${experiment_dir}/benchmark-results.tar.gz"
-      log "  tar -xzf ${experiment_dir}/benchmark-results.tar.gz -C ${experiment_dir}"
-      log "  rm -f ${experiment_dir}/benchmark-results.tar.gz"
+    if (( status == 0 )); then
+      return
     fi
+    if [[ "${results_copied}" != "true" ]]; then
+      log "benchmark failed; retrying result copy after ${RETRY_DELAY_SECONDS:-10}s"
+      sleep "${RETRY_DELAY_SECONDS:-10}"
+      copy_pod_results || true
+    fi
+    if [[ "${results_copied}" == "true" ]]; then
+      log "benchmark failed; copied results into ${experiment_dir}; keeping pod/${pod_name} and configmap/${configmap_name} for inspection"
+      log "inspect with: kubectl -n ${NAMESPACE} exec -it ${pod_name} -- bash"
+      "${PYTHON_BIN}" "${SCRIPT_DIR}/render_benchmark_report.py" "${experiment_dir}" || true
+      return
+    fi
+    log "benchmark failed; keeping pod/${pod_name} and configmap/${configmap_name} for inspection"
+    log "inspect with: kubectl -n ${NAMESPACE} exec -it ${pod_name} -- bash"
+    log "recover results with:"
+    log "  kubectl -n ${NAMESPACE} exec ${pod_name} -- tar -C /results -czf /tmp/benchmark-results.tar.gz ."
+    log "  kubectl -n ${NAMESPACE} cp ${pod_name}:/tmp/benchmark-results.tar.gz ${experiment_dir}/benchmark-results.tar.gz"
+    log "  tar -xzf ${experiment_dir}/benchmark-results.tar.gz -C ${experiment_dir}"
+    log "  rm -f ${experiment_dir}/benchmark-results.tar.gz"
   }
   trap on_exit EXIT
 
@@ -396,22 +440,22 @@ run_in_pod() {
     -e "s|__NAMESPACE__|$(escape_sed_replacement "${NAMESPACE}")|g" \
     -e "s|__VLLM_IMAGE__|$(escape_sed_replacement "${VLLM_IMAGE}")|g" \
     "${benchmark_manifest}" | kubectl -n "${NAMESPACE}" apply -f -
-  kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${pod_name}" --timeout=10m
+  retry_once kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${pod_name}" --timeout=10m
 
   local metadata_json
   metadata_json="$(build_metadata_json)"
-  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
+  retry_once kubectl -n "${NAMESPACE}" exec "${pod_name}" -- python -c \
     'import pathlib,sys; pathlib.Path("/results/metadata.json").write_text(sys.argv[1] + "\n", encoding="utf-8")' \
     "${metadata_json}"
 
   log "checking benchmark pod runtime dependencies"
-  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+  retry_once kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
     python -c 'import requests'
-  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+  retry_once kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
     /bin/bash -ec 'command -v tar >/dev/null'
 
   log "generating workload inside pod via ${tokenizer_url}"
-  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+  retry_once kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
     python /opt/benchmark/generate_benchmark_workload.py \
       --profile /opt/benchmark/profile.json \
       --output "${workload_file}" \
@@ -465,21 +509,10 @@ run_in_pod() {
   done
 
   log "comparing baseline, candidate-off, and candidate-on inside benchmark pod"
-  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
+  retry_once kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
     python /opt/benchmark/compare_abc_results.py /results
 
-  local archive_name="benchmark-results.tar.gz"
-  local remote_archive="/tmp/${archive_name}"
-  local local_archive="${experiment_dir}/${archive_name}"
-
-  log "archiving benchmark artifacts inside pod"
-  kubectl -n "${NAMESPACE}" exec "${pod_name}" -- \
-    tar -C /results -czf "${remote_archive}" .
-  log "copying compressed archive to ${local_archive}"
-  kubectl -n "${NAMESPACE}" cp "${pod_name}:${remote_archive}" "${local_archive}"
-  log "extracting archive into ${experiment_dir}"
-  tar -xzf "${local_archive}" -C "${experiment_dir}"
-  rm -f "${local_archive}"
+  retry_once copy_pod_results
   kubectl -n "${NAMESPACE}" exec "${pod_name}" -- rm -f "${remote_archive}" || true
 
   log "rendering HTML report"
@@ -489,7 +522,7 @@ run_in_pod() {
     log "keeping benchmark pod=${pod_name} by request"
   else
     log "removing temporary benchmark pod and assets configmap"
-    kubectl -n "${NAMESPACE}" delete "pod/${pod_name}" "configmap/${configmap_name}" \
+    retry_once kubectl -n "${NAMESPACE}" delete "pod/${pod_name}" "configmap/${configmap_name}" \
       --wait=true --timeout=5m
   fi
   trap - EXIT
