@@ -131,15 +131,25 @@ On an affinity hit the scheduler compares the bound Prefiller's priority with
 the minimum priority across live Prefillers:
 
 ```text
+margin     = max(4 * request_score, 1.0)
 overloaded = bound_priority > min_live_priority * factor + margin
 ```
 
 If overloaded, the request overflows to the load heap (`route_source` becomes
 `session-overflow` / `prefix-overflow`) and, after a successful Prefill,
 rebinds to the node the heap picked, so the abandoned hot node loses
-ownership. The additive margin prevents false triggers when all priorities are
-near zero. `0` disables the guard; enabled values must be ≥ 1, otherwise the
+ownership. `0` disables the guard; enabled values must be ≥ 1, otherwise the
 guard would flag even the least-loaded node as overloaded.
+
+The margin scales with the incoming request's own score rather than being a
+fixed constant. Under skewed (Zipf-like) load the non-hot Prefillers are
+idle, so `min_live_priority` is ~0 and the multiplicative factor contributes
+nothing; a fixed tiny margin then lets any in-flight work on the bound node
+trigger escape even though nothing is queued (observed empirically:
+~30% of prefix hits overflowed with an empty prefill queue, costing 6pp of
+cache hit ratio and +20-28% TTFT p95). Requiring a backlog worth several
+requests of the current size means an idle peer alone can never fake an
+overload signal.
 
 ### Miss-unbind (`--affinity-miss-unbind-threshold`)
 

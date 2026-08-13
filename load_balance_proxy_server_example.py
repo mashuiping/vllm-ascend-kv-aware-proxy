@@ -192,8 +192,17 @@ SESSION_HEADER_NAMES: tuple[str, ...] = (
     "session_id",
 )
 PREFIX_HASH_VERSION = "pd-prefix-v1"
-# Absolute slack so near-zero priorities do not false-trigger overload escape.
-AFFINITY_OVERLOAD_MARGIN = 1.0
+# Overload slack expressed in units of the incoming request's own score.
+# A fixed absolute margin degenerates under skewed load: when the other
+# Prefillers are idle, min_live_priority is ~0 and the multiplicative factor
+# contributes nothing, so any in-flight work on the bound node would trigger
+# escape (observed on shared-prefix-zipf: ~30% of hits overflowed while the
+# prefill queue was empty). Scaling the margin by the request score means
+# "overloaded" requires a backlog worth several requests of this size, which
+# an idle peer cannot fake.
+AFFINITY_OVERLOAD_MARGIN_REQUESTS = 4.0
+# Floor keeps the near-zero protection even for degenerate tiny scores.
+AFFINITY_OVERLOAD_MARGIN_FLOOR = 1.0
 # A cache-discounted reservation never drops below this fraction of the full
 # score: even a 100%-cached prompt still costs scheduling, attention over the
 # cached prefix and KV-transfer setup.
@@ -748,7 +757,7 @@ class SharedProxyScheduler:
         ]
         return min(live) if live else None
 
-    def _affinity_overloaded_no_lock(self, prefiller_key: str) -> bool:
+    def _affinity_overloaded_no_lock(self, prefiller_key: str, compute_load: float) -> bool:
         if self.affinity_overload_factor <= 0:
             return False
         pool = self._pool(ServerRole.PREFILL)
@@ -759,7 +768,8 @@ class SharedProxyScheduler:
         min_priority = self._min_live_prefill_priority_no_lock()
         if min_priority is None:
             return False
-        return bound_priority > min_priority * self.affinity_overload_factor + AFFINITY_OVERLOAD_MARGIN
+        margin = max(AFFINITY_OVERLOAD_MARGIN_REQUESTS * compute_load, AFFINITY_OVERLOAD_MARGIN_FLOOR)
+        return bound_priority > min_priority * self.affinity_overload_factor + margin
 
     def _resolve_affinity_no_lock(
         self,
@@ -826,7 +836,7 @@ class SharedProxyScheduler:
         prefiller_key = self._resolve_affinity_no_lock(self.session_lru, session_key, kind="session")
         if prefiller_key is not None:
             self.session_affinity_stats["hits"] += 1
-            if self._affinity_overloaded_no_lock(prefiller_key):
+            if self._affinity_overloaded_no_lock(prefiller_key, compute_load):
                 self.session_affinity_stats["overflows"] += 1
                 route_source = "session-overflow"
                 prefiller_key = None
@@ -835,7 +845,7 @@ class SharedProxyScheduler:
             prefiller_key = self._resolve_affinity_no_lock(self.prefix_lru, prefix_key, kind="prefix")
             if prefiller_key is not None:
                 self.prefix_affinity_stats["hits"] += 1
-                if self._affinity_overloaded_no_lock(prefiller_key):
+                if self._affinity_overloaded_no_lock(prefiller_key, compute_load):
                     self.prefix_affinity_stats["overflows"] += 1
                     route_source = "prefix-overflow"
                     prefiller_key = None
@@ -1402,9 +1412,9 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help=(
             "Escape affinity when the bound Prefiller priority exceeds "
-            "min_live_priority * factor + margin. 0 disables the guard; "
-            "enabled values must be >= 1 or the guard would flag the "
-            "least-loaded node as overloaded."
+            "min_live_priority * factor + margin, where margin scales with the "
+            "incoming request's own score so idle peers alone cannot trigger "
+            "escape. 0 disables the guard; enabled values must be >= 1."
         ),
     )
     parser.add_argument(

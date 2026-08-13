@@ -785,6 +785,37 @@ def test_affinity_overload_does_not_trigger_near_zero_priorities():
     scheduler.complete_prefill(hit["key"], 1.0, "session", None, route_source="session")
 
 
+def test_affinity_overload_ignores_idle_peers_without_real_backlog():
+    """Regression: with idle peers min_live_priority is ~0 and a fixed tiny
+    margin let any in-flight work trigger escape (shared-prefix-zipf run
+    20260813: ~30% of hits overflowed while the prefill queue was empty)."""
+    scheduler = make_scheduler(affinity_overload_factor=3.0)
+    first = scheduler.begin_request(100.0, 100.0, "session")
+    scheduler.complete_prefill(first["key"], 100.0, "session", None, route_source="heap")
+    bound = first["key"]
+    other = next(key for key in scheduler.prefillers if key != bound)
+    scheduler.prefillers[other].active_tokens = 0.0
+    scheduler.prefillers[other].active_kv_cache = 0.0
+
+    # Bound node carries less than the 4-requests margin worth of backlog:
+    # priority = 300 < 0 * 3 + 4 * 100. Affinity must hold.
+    scheduler.prefillers[bound].active_tokens = 300.0
+    scheduler.prefillers[bound].active_kv_cache = 0.0
+    held = scheduler.begin_request(100.0, 100.0, "session")
+    assert held["route_source"] == "session"
+    assert held["key"] == bound
+    assert scheduler.session_affinity_stats["overflows"] == 0
+    scheduler.complete_prefill(held["key"], held["compute_load"], "session", None, route_source="session")
+
+    # A genuine backlog beyond the margin still escapes.
+    scheduler.prefillers[bound].active_tokens = 900.0
+    scheduler._reset_heap(proxy.ServerRole.PREFILL, bump_seq=True)
+    escaped = scheduler.begin_request(100.0, 100.0, "session")
+    assert escaped["route_source"] == "session-overflow"
+    assert escaped["key"] == other
+    assert scheduler.session_affinity_stats["overflows"] == 1
+
+
 def test_affinity_miss_unbind_requires_consecutive_zero_cached_tokens():
     scheduler = make_scheduler(affinity_miss_unbind_threshold=2)
     first = scheduler.begin_request(10.0, 10.0, "session")

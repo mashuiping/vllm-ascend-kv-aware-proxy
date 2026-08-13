@@ -105,7 +105,7 @@ prompts like the curl above may not produce a hit.
 | `--prefix-hash-chars` | `1024` | Characters hashed for prefix affinity (`0` disables it) |
 | `--prefix-lru-size` | `1024` | Prefix→Prefiller LRU size (`0` disables prefix affinity) |
 | `--enable-reusable-prefix-affinity-gate` | off | Commit bindings only when Prefill reports reusable prefix tokens |
-| `--affinity-overload-factor` | `0` (off) | Escape affinity when the bound Prefiller's priority exceeds `min_live_priority * factor + margin`; enabled values must be ≥ 1 |
+| `--affinity-overload-factor` | `0` (off) | Escape affinity when the bound Prefiller's priority exceeds `min_live_priority * factor + margin` (margin scales with the request's own score); enabled values must be ≥ 1 |
 | `--affinity-miss-unbind-threshold` | `0` (off) | Unbind after N consecutive `cached_tokens == 0` outcomes on affinity hits |
 | `--affinity-cache-discount-alpha` | `0` (off) | EMA smoothing for per-binding cache hit ratio; discounts affinity-hit compute reservations toward real prefill work (range `[0, 1]`) |
 | `--workers` | `1` | Uvicorn workers; affinity state is shared via a parent-bootstrapped scheduler |
