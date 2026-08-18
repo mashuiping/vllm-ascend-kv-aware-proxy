@@ -55,25 +55,40 @@ their bindings. Details: [docs/design.md](docs/design.md) and
 
 ## Quick start
 
+Drop-in for vllm-ascend's
+[`load_balance_proxy_server_example.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py)
+— same file name, same CLI, same P→D routing by default. The upstream
+[PD guide](https://docs.vllm.ai/projects/ascend/zh-cn/latest/tutorials/features/pd_disaggregation_mooncake_multi_node.html)
+applies verbatim; only KV-aware Prefiller selection is layered on top.
+
 Requirements: Python 3.10+, at least one Prefiller and one Decoder, and the
-proxy dependencies (FastAPI, HTTPX, Uvicorn—already present in the usual
+proxy dependencies (FastAPI, HTTPX, Uvicorn — already present in the usual
 vllm-ascend image).
 
+Run it directly from this clone (KV-aware routing on):
 
 ```bash
+git clone -b 0.2.0 https://github.com/mashuiping/vllm-ascend-kv-aware-proxy.git
+cd vllm-ascend-kv-aware-proxy
+
 python load_balance_proxy_server_example.py \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --workers 1 \
-  --prefiller-hosts 127.0.0.1 127.0.0.1 \
-  --prefiller-ports 7100 7101 \
-  --decoder-hosts 127.0.0.1 127.0.0.1 \
-  --decoder-ports 7200 7201 \
+  --host 0.0.0.0 --port 8000 --workers 1 \
+  --prefiller-hosts <P_IP1> <P_IP2> --prefiller-ports <P_PORT1> <P_PORT2> \
+  --decoder-hosts   <D_IP1> <D_IP2> --decoder-ports   <D_PORT1> <D_PORT2> \
   --enable-kv-cache-aware-routing \
-  --session-lru-size 4096 \
-  --prefix-hash-chars 1024 \
-  --prefix-lru-size 1024
+  --session-lru-size 4096 --prefix-hash-chars 1024 --prefix-lru-size 1024
 ```
+
+Or swap the upstream script in place so existing runbooks keep working (the
+proxy behaves like the upstream one — drop the four `--enable-...` /
+`--*-lru-size` / `--prefix-hash-chars` flags for the unbumped defaults):
+
+```bash
+cp /vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py{,.bak}
+cp load_balance_proxy_server_example.py \
+   /vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+```
+
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -129,16 +144,6 @@ session to a Prefiller. Prefillers must expose complete `prompt_tokens_details`
 (enable **`--enable-prompt-tokens-details`** on vLLM, with prefix caching).
 Without those fields the proxy logs a warning and falls back to optimistic bind.
 See [docs/design.md](docs/design.md).
-
-## Results
-
-Benchmark charts and published Ascend A/B/C numbers will be added here.
-
-To reproduce measurements locally, see
-[benchmarks/README.md](benchmarks/README.md) and
-[docs/benchmark-methodology.md](docs/benchmark-methodology.md).
-For a sample Ascend P/D Kubernetes topology, see
-[deploy/kubernetes/qwen3-32b-4p4d-tp2/README.md](deploy/kubernetes/qwen3-32b-4p4d-tp2/README.md).
 
 ## License and provenance
 
