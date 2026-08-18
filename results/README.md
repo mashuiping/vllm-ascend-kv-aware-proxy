@@ -8,8 +8,8 @@ artifacts under `results/published/<experiment-id>/`.
 
 The six `20260810T002611Z-abc` through `20260810T010902Z-abc` runs are invalid.
 Their A-group health samples contain candidate-only `prefill_loads` and
-`active_tokens` fields, proving that the declared exact baseline source was not
-mounted. They must not be used for performance claims. New Pod-mode runs verify
+`active_tokens` fields, which means the declared baseline source was not
+mounted. Do not use these runs for performance claims. New Pod-mode runs verify
 the mounted proxy SHA-256, variant, active-token weight and affinity flag before
 sending traffic.
 

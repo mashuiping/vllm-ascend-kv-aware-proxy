@@ -63,7 +63,7 @@ export NPU_RESOURCE='huawei.com/Ascend910'
 export NIC_NAME='eth0'
 ```
 
-Important optional settings:
+Optional settings:
 
 | Variable | Default |
 | --- | --- |
@@ -88,9 +88,9 @@ prompts do not require a matching increase in `PREFILL_MAX_BATCHED_TOKENS`.
 `PROXY_DECODER_COUNT` controls how many of the four already-running Decoder
 Pods are included in the Proxy backend list. Values 1 through 4 select the
 stable StatefulSet backends starting at `pd-decode-0`; changing it redeploys
-only the Proxy and does not change or restart the Decoder engines. It is useful
-for targeted pressure experiments. `DECODE_MAX_NUM_SEQS`, by contrast, is a
-vLLM engine startup argument and changing it requires a Decoder rollout.
+only the Proxy and does not change or restart the Decoder engines. Use it for
+pressure experiments that need fewer visible Decoders. `DECODE_MAX_NUM_SEQS`
+is a vLLM engine startup argument, so changing it requires a Decoder rollout.
 
 ## Select an experiment group
 

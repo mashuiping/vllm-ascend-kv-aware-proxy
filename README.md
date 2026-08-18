@@ -1,11 +1,9 @@
 # vLLM Ascend KV-aware P/D proxy
 
-A drop-in extension of the [vllm-ascend](https://github.com/vllm-project/vllm-ascend)
-disaggregated Prefill/Decode load-balancing proxy that adds **KV-cache-aware
-Prefiller routing**. Decoder selection stays load-balanced; only Prefillers use
-session and prefix affinity so reusable KV stays local.
-
-Motivated by [vllm-project/vllm-ascend#12196](https://github.com/vllm-project/vllm-ascend/issues/12196).
+A drop-in KV-cache-aware routing extension for
+[vllm-ascend](https://github.com/vllm-project/vllm-ascend) disaggregated
+Prefill/Decode deployments: Decoders stay load-balanced while Prefillers gain
+session and prefix locality.
 
 ## Why this project
 
@@ -13,12 +11,47 @@ Multi-turn chat and shared-prefix traffic only benefit from prefix caching when
 follow-up requests land on the Prefiller that already holds the KV. A pure
 load-balancing proxy scatters that locality.
 
-Compared with heavier stacks such as [llm-d](https://github.com/llm-d/llm-d) or
-Higress-based KV-aware gateways, this project keeps the ops surface small: no
-separate control plane, no extra sidecars—just the familiar Ascend P/D proxy
-plus two affinity policies. For **vllm-ascend** deployments it is intended to be
-out of the box: run Prefillers and Decoders as usual, point this proxy at them,
-and enable `--enable-kv-cache-aware-routing`.
+Stacks such as [llm-d](https://github.com/llm-d/llm-d) and Higress-based
+KV-aware gateways use additional components. This project adds two affinity
+policies directly to the Ascend P/D proxy, without a separate control plane or
+sidecars. Existing **vllm-ascend** deployments can keep their Prefillers and
+Decoders, replace the proxy script, and enable
+`--enable-kv-cache-aware-routing`.
+
+## Benchmark highlights
+
+KV-aware routing turns cache locality into less Prefill work and lower latency.
+In controlled A/B tests, enabling affinity on the same candidate proxy produced
+the following results (mean of six paired repetitions; lower is better for
+tokens and latency):
+
+| Workload | Metric | Affinity off | Affinity on | Change (95% CI) |
+| --- | --- | ---: | ---: | ---: |
+| **Multi-turn sessions** | Cached-token ratio | 42.5% | **89.4%** | **+46.8 pp** (+44.9 to +49.0 pp) |
+| | Computed prompt tokens / warm request | 1,605 | **298** | **-81.4%** (-82.1% to -80.8%) |
+| | Prefill time, mean | 581 ms | **243 ms** | **-58.2%** (-59.6% to -56.7%) |
+| | TTFT p95 | 2,532 ms | **1,266 ms** | **-49.9%** (-52.6% to -47.2%) |
+| | End-to-end latency p95 | 4,804 ms | **3,548 ms** | **-26.1%** (-27.5% to -24.8%) |
+| | Request throughput | 4.99 req/s | **5.88 req/s** | **+17.8%** (+16.2% to +19.2%) |
+| **Shared prefixes** | Cached-token ratio | 85.1% | **97.3%** | **+12.1 pp** (+12.0 to +12.3 pp) |
+| | Computed prompt tokens / warm request | 345 | **63** | **-81.7%** (-81.8% to -81.5%) |
+| | Prefill time, mean | 171 ms | **91 ms** | **-46.9%** (-47.1% to -46.6%) |
+| | TTFT p95 | 970 ms | **730 ms** | **-24.8%** (-25.7% to -24.1%) |
+| | End-to-end latency p95 | 3,370 ms | **3,258 ms** | **-3.4%** (-4.9% to -1.7%) |
+
+The session workload used 60 five-turn conversations with a 2,048-token system
+prompt. The shared-prefix workload used 32 independently reusable 2,048-token
+prefixes across a 2/5/10/20 QPS Poisson ramp. Both ran on Qwen3-32B with four
+TP2 Prefillers and four TP2 Decoders across two 8× Ascend 910B2 nodes. Every
+repetition reused an identical workload across groups, changed the workload
+seed, reset and verified Prefiller caches, and rotated through all six A/B/C
+execution orders. All requests succeeded.
+
+These results apply to the workloads and topology described above. The
+[benchmark methodology](docs/benchmark-methodology.md),
+[reproduction guide](benchmarks/README.md), and
+[controlled deployment](deploy/kubernetes/qwen3-32b-4p4d-tp2/README.md) describe
+the experiment and how to rerun it.
 
 ## Two Prefiller affinity modes
 
@@ -57,18 +90,21 @@ their bindings. Details: [docs/design.md](docs/design.md) and
 
 Drop-in for vllm-ascend's
 [`load_balance_proxy_server_example.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py)
-— same file name, same CLI, same P→D routing by default. The upstream
+— same file name, upstream-compatible CLI with optional KV-aware flags, and the
+same P→D routing by default. The upstream
 [PD guide](https://docs.vllm.ai/projects/ascend/zh-cn/latest/tutorials/features/pd_disaggregation_mooncake_multi_node.html)
 applies verbatim; only KV-aware Prefiller selection is layered on top.
 
 Requirements: Python 3.10+, at least one Prefiller and one Decoder, and the
 proxy dependencies (FastAPI, HTTPX, Uvicorn — already present in the usual
-vllm-ascend image).
+vllm-ascend image). Prefillers must run with prefix caching enabled (for example,
+`--enable-prefix-caching`) to realize the cache-hit and latency benefits; routing
+affinity alone only preserves locality.
 
 Run it directly from this clone (KV-aware routing on):
 
 ```bash
-git clone -b 0.2.0 https://github.com/mashuiping/vllm-ascend-kv-aware-proxy.git
+git clone https://github.com/mashuiping/vllm-ascend-kv-aware-proxy.git
 cd vllm-ascend-kv-aware-proxy
 
 python load_balance_proxy_server_example.py \
@@ -89,6 +125,7 @@ cp load_balance_proxy_server_example.py \
    /vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
 ```
 
+Send a request through the proxy:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -124,17 +161,17 @@ prompts like the curl above may not produce a hit.
 | `--affinity-cache-discount-alpha` | `0` (off) | EMA smoothing for per-binding cache hit ratio; discounts affinity-hit compute reservations toward real prefill work (range `[0, 1]`) |
 | `--workers` | `1` | Uvicorn workers; affinity state is shared via a parent-bootstrapped scheduler |
 
-The affinity guards are independent opt-ins layered on KV-aware routing: the
-miss-unbind threshold drops bindings whose KV has been evicted, and the cache
-discount keeps load accounting honest for highly-cached prompts so heap
-routing is not biased against exactly the nodes affinity is helping. An
+The affinity guards are independent opt-ins layered on KV-aware routing. The
+miss-unbind threshold drops bindings whose KV has been evicted. The cache
+discount makes compute reservations reflect the work left after cache hits, so
+the heap does not overestimate load on a Prefiller serving cached prompts. An
 overload escape valve (`--affinity-overload-factor`) existed through tag
-`0.2.0` and was removed: A/B/C experiments showed instantaneous priority
-comparison cannot tell Poisson bursts from real backlog, so it only produced
-false-positive escapes that recomputed large prefixes on cold nodes (up to
-+15% TTFT p95) while a genuine prefill backlog never materialised — affinity
-itself keeps prefill cheap enough that the hot node does not saturate.
-See [docs/design.md](docs/design.md#affinity-robustness-guards).
+`0.2.0` and was removed. In A/B/C experiments, instantaneous priority
+comparison treated Poisson bursts as backlog. Every escape recomputed a large
+prefix on a cold node, increasing TTFT p95 by up to 15%, while none of the runs
+produced a sustained Prefill backlog. The
+[design notes](docs/design.md#affinity-robustness-guards) cover these guards in
+more detail.
 
 `--enable-reusable-prefix-affinity-gate` commits session/prefix bindings only when
 Prefill reports reusable prefix tokens

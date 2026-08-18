@@ -15,15 +15,15 @@ the vllm-ascend tag `v0.23.0rc1`.
 
 The baseline file is stored byte-for-byte in
 [`load_balance_proxy_server_example.py`](load_balance_proxy_server_example.py).
-The repository-root file is the KV-cache-aware candidate intended for
-experimentation and eventual upstream contribution.
+The repository-root file is the KV-cache-aware candidate used in experiments
+and prepared for upstream review.
 
 The initial implementation is motivated by
 [vllm-ascend issue #12196](https://github.com/vllm-project/vllm-ascend/issues/12196).
 It keeps Decoder selection load-balanced and applies affinity only to
 Prefillers, where reusable prefix KV is located.
 
-It exists solely to make the A/B/C experiment reproducible:
+The snapshot provides the fixed A group in the A/B/C experiment:
 
 - A: this upstream baseline;
 - B: the candidate proxy with KV-aware routing disabled;

@@ -1,7 +1,7 @@
 # Benchmark workloads and tooling
 
-The production benchmark uses one immutable JSONL workload for all A/B/C
-groups. Never generate a separate workload per group: the JSONL file fixes
+The benchmark uses one immutable JSONL workload for all A/B/C groups. Do not
+generate a separate workload per group: the JSONL file fixes
 session IDs, messages, request order, load-stage offsets, output limits and the
 random seed.
 
@@ -19,7 +19,7 @@ in this directory alongside the checked-in workload profiles.
 | `session-affinity-zipf.json`  | Same shape as `session-affinity.json` but measure-turn traffic is Zipf-skewed (`zipf_alpha` 1.2) onto hot sessions | Single-node hot-spot pressure for affinity-guard experiments |
 | `shared-prefix-zipf.json`     | 32 groups × 8 prompts, QPS-stage group selection Zipf-skewed (`zipf_alpha` 1.2)                 | Cross-session hot-prefix pressure for affinity-guard experiments |
 | `shared-prefix-capacity-pressure.json` | 96 groups × 8,192-token shared prefix (~786K prefix tokens total), Poisson QPS ladder up to 20 | KV eviction churn: total prefix corpus sized to 2–3× one node's KV capacity |
-| `shared-prefix-capacity-zipf.json` | Capacity-pressure working set plus `zipf_alpha` 1.2 hot groups, QPS ladder up to 30 | Saturate a single hot Prefiller under KV pressure (used to falsify the removed overload escape valve) |
+| `shared-prefix-capacity-zipf.json` | Capacity-pressure working set plus `zipf_alpha` 1.2 hot groups, QPS ladder up to 30 | Saturate a single hot Prefiller under KV pressure (used to test the removed overload escape valve) |
 | `smoke.json`                  | 2 sessions × 2 turns                                                                            | Offline generator and test smoke case     |
 
 The Zipf profiles set the optional `data.zipf_alpha` field: after a first
@@ -115,11 +115,10 @@ to the runner.
 
 ### `load-balance-active-tokens.json`
 
-This profile is designed to expose the transient Prefill load signal. It is
-not a cache-locality test:
-every request has a unique prompt, session headers are disabled, and the
-primary comparison is Prefill queue time, TTFT tail latency and per-node load
-balance.
+This profile measures the transient Prefill load signal. It does not test cache
+locality: every request has a unique prompt, session headers are disabled, and
+the primary comparison is Prefill queue time, TTFT tail latency and per-node
+load balance.
 
 #### Lifecycle that creates a B/C routing difference
 
@@ -207,7 +206,7 @@ state.
 Health sampling is reduced from one second to 100 ms because the relevant
 phase transition is transient. The initial mechanism-validation run showed the
 expected routing divergence only near and above the capacity knee, so the
-formal profile spends 30/60/90 seconds below/at/above the knee respectively.
+checked-in profile spends 30/60/90 seconds below/at/above the knee respectively.
 This preserves a low-pressure negative control while concentrating tail samples
 in the informative 4.5 QPS stage. The runner drains the stage before starting
 the next one and records independent per-stage engine-counter snapshots,
@@ -266,17 +265,17 @@ scores for each request. Lifecycle rates use only samples with non-zero
 Prefiller KV load. `lifecycle_overlap_sample_rate` reports loaded snapshots
 containing both running Prefill and waiting-KV work. `lifecycle_skew_sample_rate`
 requires at least two loaded Prefillers to have different `Q/(Q+W)` ratios.
-`shadow_heap_divergence_sample_rate` is the strongest quick check: for each
+`shadow_heap_divergence_sample_rate` is the most direct quick check: for each
 sample it computes the baseline and candidate heap choices from the same
 candidate state and reports how often their selected Prefiller differs. It is
 a sampled counterfactual, not the actual cross-run route difference, but a
 zero value means the profile still did not expose the intended scoring choice.
 
-This is a mechanism-validation topology, not the final production claim. If
-it produces a repeatable A/B difference, rerun the comparison with
+This topology validates the mechanism; it does not measure production
+capacity. If it produces a repeatable A/B difference, rerun the comparison with
 `BENCHMARK_DECODER_COUNT=4` on the normal 4P4D topology. A difference only in
-the two-Decoder run proves that the lifecycle signal can affect routing under
-Decode backpressure; it does not prove a material benefit in the production
+the two-Decoder run shows that the lifecycle signal can affect routing under
+Decode backpressure. It does not establish a material benefit at the production
 capacity ratio.
 
 ### `shared-prefix-capacity.json`
@@ -652,9 +651,9 @@ either way), so load accounting tracks real compute instead of raw prompt
 size.
 
 This mode previously also drove an overload escape valve
-(`AFFINITY_OVERLOAD_FACTOR`), removed in 0.2.x after the runs it was built
-for falsified it: every escape was a false positive on burst imbalance, and
-no run produced a genuinely backlogged hot Prefiller (see docs/design.md,
+(`AFFINITY_OVERLOAD_FACTOR`). It was removed in 0.2.x because its evaluation
+runs found only false positives caused by burst imbalance; no run produced a
+sustained backlog on the hot Prefiller (see docs/design.md,
 "Affinity robustness guards").
 
 ```bash
@@ -707,8 +706,8 @@ whether every repetition used a distinct workload seed.
 The 2026-08-06/07 affinity runs predate the proxy-identity verification, the
 same-policy noise control and the affinity instrumentation, so they cannot
 support performance claims. `run_affinity_repetitions.sh` re-runs
-`session-affinity.json` and `shared-prefix-capacity.json` on the hardened
-harness — six repetitions per profile with the full Latin-square order rotation
+`session-affinity.json` and `shared-prefix-capacity.json` on the current
+harness: six repetitions per profile with the full Latin-square order rotation
 and distinct seeds — then aggregates and applies the noise-gate verdict:
 
 ```bash
